@@ -20,6 +20,7 @@ from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as M
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
+from .pose_act.configuration_pose_act import PoseACTConfig as PoseACTConfig
 from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .rtc import ActionInterpolator as ActionInterpolator
 from .sac.configuration_sac import SACConfig as SACConfig
@@ -45,6 +46,7 @@ __all__ = [
     "PI0Config",
     "PI0FastConfig",
     "PI05Config",
+    "PoseACTConfig",
     "RewardClassifierConfig",
     "SACConfig",
     "SARMConfig",
