@@ -42,7 +42,7 @@ from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
-from lerobot.utils.feature_utils import dataset_to_policy_features
+from lerobot.utils.feature_utils import dataset_to_policy_features, infer_policy_feature_sets
 
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
@@ -507,6 +507,7 @@ def make_policy(
     kwargs = {}
     if ds_meta is not None:
         features = dataset_to_policy_features(ds_meta.features)
+        inferred_input_features, inferred_output_features = infer_policy_feature_sets(cfg, ds_meta.features)
     else:
         if not cfg.pretrained_path:
             logging.warning(
@@ -518,9 +519,15 @@ def make_policy(
             raise ValueError("env_cfg cannot be None when ds_meta is not provided")
         features = env_to_policy_features(env_cfg)
 
-    cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    if ds_meta is not None:
+        cfg.output_features = inferred_output_features
+    else:
+        cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
-        cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+        if ds_meta is not None:
+            cfg.input_features = inferred_input_features
+        else:
+            cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
 
     # Store action feature names for relative_exclude_joints support
     if ds_meta is not None and hasattr(cfg, "action_feature_names"):

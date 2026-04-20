@@ -22,6 +22,7 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
+from lerobot.utils.feature_utils import infer_policy_feature_sets
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
@@ -48,12 +49,18 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
-    for key in ds_meta.features:
-        if key == REWARD and cfg.reward_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
-        if key == ACTION and cfg.action_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
+    selected_obs_keys = {
+        key for key in (cfg.input_features or {}) if key.startswith(OBS_PREFIX) and key in ds_meta.features
+    }
+    if not selected_obs_keys:
+        selected_obs_keys = {key for key in ds_meta.features if key.startswith(OBS_PREFIX)}
+
+    if cfg.reward_delta_indices is not None and REWARD in ds_meta.features:
+        delta_timestamps[REWARD] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
+    if cfg.action_delta_indices is not None and ACTION in ds_meta.features:
+        delta_timestamps[ACTION] = [i / ds_meta.fps for i in cfg.action_delta_indices]
+    if cfg.observation_delta_indices is not None:
+        for key in selected_obs_keys:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:
@@ -82,6 +89,10 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+        inferred_input_features, inferred_output_features = infer_policy_feature_sets(cfg.policy, ds_meta.features)
+        cfg.policy.output_features = inferred_output_features
+        if not cfg.policy.input_features:
+            cfg.policy.input_features = inferred_input_features
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(

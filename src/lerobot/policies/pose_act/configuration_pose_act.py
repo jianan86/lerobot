@@ -28,6 +28,7 @@ class PoseACTConfig(ACTConfig):
 
     n_obs_steps: int = 2
     img_obs_horizon: int = 2
+    image_feature_key: str | None = None
 
     def __post_init__(self):
         # Keep a single source of truth for image/state history in v1.

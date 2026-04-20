@@ -25,9 +25,9 @@ from typing import Any
 
 import numpy as np
 
-from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 
-from .constants import ACTION, DEFAULT_FEATURES, OBS_ENV_STATE, OBS_STR
+from .constants import ACTION, DEFAULT_FEATURES, OBS_ENV_STATE, OBS_STATE, OBS_STR
 
 
 def _validate_feature_names(features: dict[str, dict]) -> None:
@@ -152,7 +152,7 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
 
             names = ft["names"]
             # Backward compatibility for "channel" which is an error introduced in LeRobotDataset v2.0 for ported datasets.
-            if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
+            if names is not None and names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
                 shape = (shape[2], shape[0], shape[1])
         elif key == OBS_ENV_STATE:
             type = FeatureType.ENV
@@ -169,6 +169,41 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
         )
 
     return policy_features
+
+
+def infer_policy_feature_sets(
+    cfg: PreTrainedConfig, features: dict[str, dict]
+) -> tuple[dict[str, PolicyFeature], dict[str, PolicyFeature]]:
+    """Infer policy input/output features from dataset features and config overrides."""
+    policy_features = dataset_to_policy_features(features)
+    output_features = {key: ft for key, ft in policy_features.items() if ft.type is FeatureType.ACTION}
+    input_features = {key: ft for key, ft in policy_features.items() if key not in output_features}
+
+    if cfg.type == "pose_act":
+        input_features = {
+            key: ft
+            for key, ft in input_features.items()
+            if key == OBS_STATE or ft.type is FeatureType.VISUAL
+        }
+
+    image_feature_key = getattr(cfg, "image_feature_key", None)
+    if image_feature_key is None:
+        return input_features, output_features
+
+    if image_feature_key not in policy_features:
+        raise ValueError(
+            f"Requested image feature {image_feature_key!r} is not present in the dataset features. "
+            f"Available features: {sorted(policy_features)}."
+        )
+    if policy_features[image_feature_key].type is not FeatureType.VISUAL:
+        raise ValueError(f"Requested image feature {image_feature_key!r} is not a visual feature.")
+
+    input_features = {
+        key: ft
+        for key, ft in input_features.items()
+        if ft.type is not FeatureType.VISUAL or key == image_feature_key
+    }
+    return input_features, output_features
 
 
 def combine_feature_dicts(*dicts: dict) -> dict:

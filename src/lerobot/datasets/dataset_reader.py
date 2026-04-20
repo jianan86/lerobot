@@ -200,7 +200,10 @@ class DatasetReader:
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self._meta.video_keys:
+        video_keys = self._meta.video_keys
+        if query_indices is not None:
+            video_keys = [key for key in video_keys if key in query_indices]
+        for key in video_keys:
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
@@ -279,6 +282,10 @@ class DatasetReader:
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
+            for key in list(item):
+                if key.startswith("observation.") and key not in query_indices:
+                    item.pop(key, None)
+                    item.pop(f"{key}_is_pad", None)
 
         if len(self._meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
