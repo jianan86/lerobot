@@ -64,6 +64,35 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    # Dummy / shell modes (skip loading a real policy checkpoint)
+    dummy_policy: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, skip loading checkpoint and return zero action chunks (framework test mode)."
+        },
+    )
+    dummy_action_dim: int = field(
+        default=10,
+        metadata={"help": "Action dimension used when dummy_policy is True."},
+    )
+    pose_act_shell: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, treat incoming pose_act policy_type as a shell: validate & print observations, "
+            "sleep inference_latency, return a zero relative pose10d chunk. Client is expected to convert "
+            "the chunk into Piper EndPoseCtrl commands."
+        },
+    )
+    pose_act_shell_motion: str = field(
+        default="zero",
+        metadata={
+            "help": "Motion pattern used by the pose_act shell when generating fake action chunks. "
+            "'zero' returns an all-zero relative pose10d (arm stays put). "
+            "'drift_stop_osc' returns a small constant +x drift for ~1s then stops, with the gripper "
+            "oscillating as a continuous sine so the client can verify end-to-end control."
+        },
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:

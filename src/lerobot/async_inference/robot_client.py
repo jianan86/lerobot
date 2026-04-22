@@ -58,6 +58,7 @@ from lerobot.robots import (  # noqa: F401
     omx_follower,
     so_follower,
 )
+from lerobot.robots import mock_piper_follower, piper_follower  # noqa: F401
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
@@ -65,6 +66,7 @@ from lerobot.transport import (
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
 
+from .adapters import PoseActPiperAdapter, is_pose_act_piper
 from .configs import RobotClientConfig
 from .helpers import (
     Action,
@@ -94,6 +96,10 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
+
+        self._pose_act_adapter: PoseActPiperAdapter | None = None
+        if is_pose_act_piper(config.policy_type, config.robot.type):
+            self._pose_act_adapter = PoseActPiperAdapter(self.robot)
 
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
@@ -364,8 +370,12 @@ class RobotClient:
             return not self.action_queue.empty()
 
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
-        action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
-        return action
+        if self._pose_act_adapter is not None:
+            return self._pose_act_adapter.convert(action_tensor)
+
+        keys = list(self.robot.action_features)
+        n = min(len(keys), int(action_tensor.shape[0]))
+        return {keys[i]: action_tensor[i].item() for i in range(n)}
 
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
         """Reading and performing actions in local queue"""

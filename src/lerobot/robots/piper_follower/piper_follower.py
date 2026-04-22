@@ -77,7 +77,15 @@ class PiperFollower(Robot):
             "ee.delta_rz": float,
             "gripper.delta": float,
         }
-        return {**self._motors_ft, **joint_deltas, **ee_deltas}
+        ee_abs = {
+            "ee.abs_x": float,
+            "ee.abs_y": float,
+            "ee.abs_z": float,
+            "ee.abs_rx": float,
+            "ee.abs_ry": float,
+            "ee.abs_rz": float,
+        }
+        return {**self._motors_ft, **joint_deltas, **ee_deltas, **ee_abs}
 
     @property
     def is_connected(self) -> bool:
@@ -187,6 +195,33 @@ class PiperFollower(Robot):
 
         return clipped
 
+    def _apply_ee_safety(self, target: dict[str, float], pose: dict[str, float]) -> dict[str, float]:
+        """Cap per-axis |target - pose| using ``max_relative_target`` when it is a float.
+
+        The per-joint dict form of ``max_relative_target`` is reserved for the joint path.
+        """
+        cap = self.config.max_relative_target
+        if not isinstance(cap, float):
+            return target
+        safe = {}
+        for axis, val in target.items():
+            base = pose[axis]
+            diff = max(-cap, min(cap, val - base))
+            safe[axis] = base + diff
+        return safe
+
+    def _send_ee_pose_target(self, target: dict[str, float]) -> None:
+        assert self.piper is not None
+        self.piper.MotionCtrl_2(0x01, 0x00, self.config.move_spd_rate_ctrl, 0x00)
+        self.piper.EndPoseCtrl(
+            round(target["x"] * MILLI_MM_PER_METER),
+            round(target["y"] * MILLI_MM_PER_METER),
+            round(target["z"] * MILLI_MM_PER_METER),
+            round(target["rx"] * MILLI_DEG_PER_RAD),
+            round(target["ry"] * MILLI_DEG_PER_RAD),
+            round(target["rz"] * MILLI_DEG_PER_RAD),
+        )
+
     def _send_ee_delta_action(self, action: RobotAction) -> None:
         assert self.piper is not None
         if not any(key.startswith("ee.delta_") for key in action):
@@ -202,21 +237,30 @@ class PiperFollower(Robot):
             "rz": pose["rz"] + float(action.get("ee.delta_rz", 0.0)),
         }
 
-        self.piper.MotionCtrl_2(0x01, 0x00, self.config.move_spd_rate_ctrl, 0x00)
-        self.piper.EndPoseCtrl(
-            round(target["x"] * MILLI_MM_PER_METER),
-            round(target["y"] * MILLI_MM_PER_METER),
-            round(target["z"] * MILLI_MM_PER_METER),
-            round(target["rx"] * MILLI_DEG_PER_RAD),
-            round(target["ry"] * MILLI_DEG_PER_RAD),
-            round(target["rz"] * MILLI_DEG_PER_RAD),
-        )
+        self._send_ee_pose_target(self._apply_ee_safety(target, pose))
+
+    def _send_ee_abs_action(self, action: RobotAction) -> None:
+        assert self.piper is not None
+        if not any(key.startswith("ee.abs_") for key in action):
+            return
+
+        pose = self._get_end_pose()
+        target = {
+            "x": float(action.get("ee.abs_x", pose["x"])),
+            "y": float(action.get("ee.abs_y", pose["y"])),
+            "z": float(action.get("ee.abs_z", pose["z"])),
+            "rx": float(action.get("ee.abs_rx", pose["rx"])),
+            "ry": float(action.get("ee.abs_ry", pose["ry"])),
+            "rz": float(action.get("ee.abs_rz", pose["rz"])),
+        }
+        self._send_ee_pose_target(self._apply_ee_safety(target, pose))
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
         assert self.piper is not None
         goal_pos = self._clip_action(action)
         self._send_ee_delta_action(action)
+        self._send_ee_abs_action(action)
 
         if any(name in goal_pos for name in JOINT_NAMES):
             current = self._get_motor_positions()
