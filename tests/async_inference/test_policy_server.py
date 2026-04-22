@@ -217,3 +217,79 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_predict_pose_act_pose7d_chunk(monkeypatch):
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.helpers import TimedObservation
+    from lerobot.async_inference.policy_server import PolicyServer
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies import make_pre_post_processors
+    from lerobot.policies.pose_act.configuration_pose_act import PoseACTConfig
+    from lerobot.policies.pose_act.utils import pose7d_to_pose10d
+    from lerobot.utils.constants import ACTION
+
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        input_features={
+            "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+    )
+
+    class PoseACTStub:
+        def __init__(self, cfg):
+            self.config = cfg
+
+    server = PolicyServer(PolicyServerConfig(host="localhost", port=9998))
+    server.policy_type = "pose_act"
+    server.policy = PoseACTStub(config)
+    server.actions_per_chunk = 3
+    server.device = "cpu"
+    server.lerobot_features = {
+        OBS_STATE: {
+            "dtype": "float32",
+            "shape": (7,),
+            "names": ["x", "y", "z", "roll", "pitch", "yaw", "gripper_width"],
+        },
+        "observation.images.fisheye_rgb": {
+            "dtype": "image",
+            "shape": (32, 32, 3),
+            "names": ["height", "width", "channels"],
+        },
+    }
+    server.preprocessor, server.postprocessor = make_pre_post_processors(config, dataset_stats=None)
+
+    def _fake_get_action_chunk(_self, _obs):
+        base = pose7d_to_pose10d(torch.tensor([[0.2, 0.0, 0.3, 0.0, 0.0, 0.0, 0.04]]))
+        return base[:, None, :].repeat(1, server.actions_per_chunk, 1)
+
+    monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
+
+    obs = TimedObservation(
+        observation={
+            "x": 0.2,
+            "y": 0.0,
+            "z": 0.3,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 0.0,
+            "gripper_width": 0.04,
+            "fisheye_rgb": torch.zeros(32, 32, 3, dtype=torch.uint8).numpy(),
+        },
+        timestamp=time.time(),
+        timestep=7,
+        must_go=True,
+    )
+
+    timed_actions = server._predict_action_chunk(obs)
+    assert len(timed_actions) == server.actions_per_chunk
+    assert timed_actions[0].get_action().shape == (7,)
+    torch.testing.assert_close(
+        timed_actions[0].get_action(),
+        torch.tensor([0.4, 0.0, 0.6, 0.0, -0.0, 0.0, 0.04]),
+        rtol=0,
+        atol=1e-5,
+    )

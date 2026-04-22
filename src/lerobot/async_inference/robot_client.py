@@ -66,7 +66,7 @@ from lerobot.transport import (
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
 
-from .adapters import PoseActPiperAdapter, is_pose_act_piper
+from .adapters import POSE7D_NAMES, PoseActPiperAdapter, is_pose_act_piper
 from .configs import RobotClientConfig
 from .helpers import (
     Action,
@@ -101,7 +101,10 @@ class RobotClient:
         if is_pose_act_piper(config.policy_type, config.robot.type):
             self._pose_act_adapter = PoseActPiperAdapter(self.robot)
 
-        lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
+        if self._pose_act_adapter is not None:
+            lerobot_features = self._pose_act_piper_lerobot_features()
+        else:
+            lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
         # Use environment variable if server_address is not provided in config
         self.server_address = config.server_address
@@ -141,6 +144,24 @@ class RobotClient:
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
+
+    def _pose_act_piper_lerobot_features(self) -> dict[str, dict]:
+        """Feature contract for pose_act: pose7d state plus the robot cameras."""
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (len(POSE7D_NAMES),),
+                "names": list(POSE7D_NAMES),
+            }
+        }
+        for key, shape in self.robot.observation_features.items():
+            if isinstance(shape, tuple):
+                features[f"observation.images.{key}"] = {
+                    "dtype": "image",
+                    "shape": shape,
+                    "names": ["height", "width", "channels"],
+                }
+        return features
 
     @property
     def running(self):
@@ -421,6 +442,11 @@ class RobotClient:
             start_time = time.perf_counter()
 
             raw_observation: RawObservation = self.robot.get_observation()
+            if self._pose_act_adapter is not None:
+                pose7d = self._pose_act_adapter.current_pose7d()
+                raw_observation.update(
+                    {name: float(value) for name, value in zip(POSE7D_NAMES, pose7d.tolist(), strict=True)}
+                )
             raw_observation["task"] = task
 
             with self.latest_action_lock:

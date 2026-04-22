@@ -29,6 +29,7 @@ import math
 import pickle  # nosec
 import threading
 import time
+from collections import deque
 from concurrent import futures
 from dataclasses import asdict
 from pprint import pformat
@@ -40,6 +41,7 @@ import grpc
 import torch
 
 from lerobot.policies import get_policy_class, make_pre_post_processors
+from lerobot.policies.pose_act.utils import pose10d_to_pose7d, pose7d_to_pose10d
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -47,6 +49,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
 from lerobot.types import PolicyAction
+from lerobot.utils.constants import OBS_STATE
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -83,6 +86,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # State for pose_act shell motion generators (reset on each new client session).
         self._shell_step_count: int = 0
         self._shell_t0: float | None = None
+        self._pose_act_obs_history: dict[str, deque[torch.Tensor]] = {}
 
         # Attributes will be set by SendPolicyInstructions
         self.device = None
@@ -112,6 +116,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self._shell_step_count = 0
         self._shell_t0 = None
+        self._pose_act_obs_history = {}
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -363,6 +368,121 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return chunk[:, : self.actions_per_chunk, :]
 
+    def _is_pose_act_pose7d_observation(self, observation: Observation) -> bool:
+        state = observation.get(OBS_STATE)
+        return (
+            self.policy_type == "pose_act"
+            and isinstance(state, torch.Tensor)
+            and state.shape[-1] == 7
+        )
+
+    def _append_pose_act_history(self, key: str, value: torch.Tensor) -> None:
+        horizon = int(self.policy.config.n_obs_steps)
+        queue = self._pose_act_obs_history.setdefault(key, deque(maxlen=horizon))
+        value = value.detach().clone()
+        if len(queue) == 0:
+            queue.extend(value.clone() for _ in range(horizon))
+        else:
+            queue.append(value)
+
+    def _prepare_pose_act_observation(self, observation: Observation) -> Observation:
+        """Convert base-frame pose7d observation to pose_act's batched pose10d history."""
+        state7d = observation[OBS_STATE]
+        if state7d.ndim == 2:
+            state7d = state7d.squeeze(0)
+        if state7d.ndim != 1 or state7d.shape[0] != 7:
+            raise ValueError(f"pose_act async expects observation.state shape (7,), got {tuple(state7d.shape)}")
+
+        image_shapes = {}
+        for key in self.policy.config.image_features:
+            value = observation[key]
+            image_shapes[key] = tuple(value.shape)
+        self.logger.info(
+            f"PoseACT input state7d={state7d.tolist()} image_shapes={image_shapes}"
+        )
+
+        state10d = pose7d_to_pose10d(state7d.to(torch.float32).cpu())
+        self._append_pose_act_history(OBS_STATE, state10d)
+
+        for key in self.policy.config.image_features:
+            image = observation[key]
+            if image.ndim == 4:
+                image = image.squeeze(0)
+            if image.ndim != 3:
+                raise ValueError(f"pose_act async expects image {key} shape (C,H,W), got {tuple(image.shape)}")
+            self._append_pose_act_history(key, image.to(torch.float32).cpu())
+
+        prepared: Observation = {
+            OBS_STATE: torch.stack(list(self._pose_act_obs_history[OBS_STATE]), dim=0).unsqueeze(0)
+        }
+        for key in self.policy.config.image_features:
+            prepared[key] = torch.stack(list(self._pose_act_obs_history[key]), dim=0).unsqueeze(0)
+        if "task" in observation:
+            prepared["task"] = observation["task"]
+        return prepared
+
+    def _predict_pose_act_pose7d_chunk(
+        self, observation_t: TimedObservation, observation: Observation, start_prepare: float, prepare_time: float
+    ) -> list[TimedAction]:
+        start_history = time.perf_counter()
+        observation = self._prepare_pose_act_observation(observation)
+        history_time = time.perf_counter() - start_history
+
+        start_preprocess = time.perf_counter()
+        observation = self.preprocessor(observation)
+        self.last_processed_obs = observation_t
+        preprocessing_time = time.perf_counter() - start_preprocess
+
+        start_inference = time.perf_counter()
+        action_tensor = self._get_action_chunk(observation)
+        inference_time = time.perf_counter() - start_inference
+
+        start_postprocess = time.perf_counter()
+        _, chunk_size, _ = action_tensor.shape
+        processed_actions = []
+        for i in range(chunk_size):
+            processed_actions.append(self.postprocessor(action_tensor[:, i, :]))
+        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
+        postprocessing_time = time.perf_counter() - start_postprocess
+
+        start_pose_convert = time.perf_counter()
+        action_tensor = pose10d_to_pose7d(action_tensor)
+        pose_convert_time = time.perf_counter() - start_pose_convert
+
+        if self.config.pose_act_safe_return_current_pose:
+            state7d = observation_t.get_observation()
+            current_pose7d = torch.tensor(
+                [
+                    state7d["x"],
+                    state7d["y"],
+                    state7d["z"],
+                    state7d["roll"],
+                    state7d["pitch"],
+                    state7d["yaw"],
+                    state7d["gripper_width"],
+                ],
+                dtype=torch.float32,
+            )
+            action_tensor = current_pose7d.unsqueeze(0).repeat(action_tensor.shape[0], 1)
+            self.logger.warning(
+                "PoseACT safe return enabled: real inference/postprocess completed, "
+                "but returned actions are overwritten with current pose7d."
+            )
+
+        action_chunk = self._time_action_chunk(
+            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+        )
+        total_time = time.perf_counter() - start_prepare
+
+        self.logger.info(
+            f"PoseACT observation {observation_t.get_timestep()} | "
+            f"prepare={prepare_time * 1000:.2f}ms history={history_time * 1000:.2f}ms "
+            f"preprocess={preprocessing_time * 1000:.2f}ms inference={inference_time * 1000:.2f}ms "
+            f"postprocess={postprocessing_time * 1000:.2f}ms pose_convert={pose_convert_time * 1000:.2f}ms "
+            f"total={total_time * 1000:.2f}ms action_shape={tuple(action_tensor.shape)}"
+        )
+        return action_chunk
+
     def _pose_act_shell_predict(self, observation_t: TimedObservation) -> list[TimedAction]:
         """Shell path for pose_act / dummy modes.
 
@@ -477,6 +597,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.policy_image_features,
         )
         prepare_time = time.perf_counter() - start_prepare
+
+        if self._is_pose_act_pose7d_observation(observation):
+            return self._predict_pose_act_pose7d_chunk(
+                observation_t, observation, start_prepare, prepare_time
+            )
 
         """2. Apply preprocessor"""
         start_preprocess = time.perf_counter()

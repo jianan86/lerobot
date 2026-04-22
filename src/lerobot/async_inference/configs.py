@@ -92,6 +92,13 @@ class PolicyServerConfig:
             "oscillating as a continuous sine so the client can verify end-to-end control."
         },
     )
+    pose_act_safe_return_current_pose: bool = field(
+        default=False,
+        metadata={
+            "help": "Temporary safety mode for real pose_act inference tests: run inference and "
+            "postprocessing, then replace returned pose7d actions with the client's current pose7d."
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""

@@ -235,6 +235,80 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
     assert robot_client._ready_to_send_observation() is expected
 
 
+def test_pose_act_piper_client_sends_pose7d_observation(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.robots.mock_piper_follower import MockPiperFollowerConfig
+
+    client = RobotClient(
+        RobotClientConfig(
+            robot=MockPiperFollowerConfig(verbose=False),
+            server_address="localhost:9999",
+            policy_type="pose_act",
+            pretrained_name_or_path="test",
+            actions_per_chunk=3,
+        )
+    )
+    sent = []
+    monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or True)
+
+    try:
+        features = client.policy_config.lerobot_features
+        assert features["observation.state"]["shape"] == (7,)
+        assert features["observation.state"]["names"] == [
+            "x",
+            "y",
+            "z",
+            "roll",
+            "pitch",
+            "yaw",
+            "gripper_width",
+        ]
+
+        raw_observation = client.control_loop_observation(task="test")
+    finally:
+        client.stop()
+
+    assert sent, "control_loop_observation should send a TimedObservation"
+    observation = sent[0].get_observation()
+    for key in ["x", "y", "z", "roll", "pitch", "yaw", "gripper_width"]:
+        assert key in observation
+        assert key in raw_observation
+
+
+def test_pose_act_piper_client_handles_pose7d_response():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.robots.mock_piper_follower import MockPiperFollowerConfig
+
+    client = RobotClient(
+        RobotClientConfig(
+            robot=MockPiperFollowerConfig(verbose=False),
+            server_address="localhost:9999",
+            policy_type="pose_act",
+            pretrained_name_or_path="test",
+            actions_per_chunk=3,
+        )
+    )
+
+    try:
+        action = client._action_tensor_to_action_dict(
+            torch.tensor([0.21, 0.02, 0.31, 0.1, 0.2, 0.3, 0.04], dtype=torch.float32)
+        )
+    finally:
+        client.stop()
+
+    assert action == {
+        "ee.abs_x": pytest.approx(0.21),
+        "ee.abs_y": pytest.approx(0.02),
+        "ee.abs_z": pytest.approx(0.31),
+        "ee.abs_rx": pytest.approx(0.1),
+        "ee.abs_ry": pytest.approx(0.2),
+        "ee.abs_rz": pytest.approx(0.3),
+        "gripper.pos": pytest.approx(0.04),
+    }
+
+
 # -----------------------------------------------------------------------------
 # Regression test: robot type registry populated by robot_client imports
 # -----------------------------------------------------------------------------

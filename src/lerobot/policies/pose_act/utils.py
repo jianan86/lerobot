@@ -44,6 +44,62 @@ def matrix_to_rotation_6d(rot_mats: Tensor) -> Tensor:
     return torch.cat((rot_mats[..., :, 0], rot_mats[..., :, 1]), dim=-1)
 
 
+def euler_rpy_to_matrix(rpy: Tensor) -> Tensor:
+    """Convert roll/pitch/yaw radians to rotation matrices.
+
+    Uses the same convention as Piper EndPoseCtrl: roll, pitch, yaw map to
+    ``Rz(yaw) @ Ry(pitch) @ Rx(roll)``.
+    """
+    if rpy.shape[-1] != 3:
+        raise ValueError(f"rpy expects final dimension 3, got {rpy.shape[-1]}")
+
+    roll, pitch, yaw = rpy.unbind(dim=-1)
+    cr, sr = torch.cos(roll), torch.sin(roll)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+
+    row0 = torch.stack((cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr), dim=-1)
+    row1 = torch.stack((sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr), dim=-1)
+    row2 = torch.stack((-sp, cp * sr, cp * cr), dim=-1)
+    return torch.stack((row0, row1, row2), dim=-2)
+
+
+def matrix_to_euler_rpy(rot_mats: Tensor) -> Tensor:
+    """Inverse of :func:`euler_rpy_to_matrix`; returns roll/pitch/yaw radians."""
+    if rot_mats.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected rotation matrices with shape (..., 3, 3), got {tuple(rot_mats.shape)}")
+
+    r20 = rot_mats[..., 2, 0].clamp(-1.0, 1.0)
+    pitch = torch.asin(-r20)
+    cos_pitch = torch.cos(pitch)
+
+    roll_regular = torch.atan2(rot_mats[..., 2, 1], rot_mats[..., 2, 2])
+    yaw_regular = torch.atan2(rot_mats[..., 1, 0], rot_mats[..., 0, 0])
+    roll_locked = torch.atan2(-rot_mats[..., 1, 2], rot_mats[..., 1, 1])
+    yaw_locked = torch.zeros_like(yaw_regular)
+
+    regular = torch.abs(cos_pitch) > 1e-6
+    roll = torch.where(regular, roll_regular, roll_locked)
+    yaw = torch.where(regular, yaw_regular, yaw_locked)
+    return torch.stack((roll, pitch, yaw), dim=-1)
+
+
+def pose7d_to_pose10d(pose7d: Tensor) -> Tensor:
+    """Convert ``[x, y, z, roll, pitch, yaw, gripper]`` to pose10d."""
+    if pose7d.shape[-1] != 7:
+        raise ValueError(f"pose7d expects final dimension 7, got {pose7d.shape[-1]}")
+    pos = pose7d[..., :3]
+    rot = euler_rpy_to_matrix(pose7d[..., 3:6])
+    grip = pose7d[..., 6:7]
+    return combine_pose10d(pos, rot, grip)
+
+
+def pose10d_to_pose7d(pose10d: Tensor) -> Tensor:
+    """Convert pose10d to ``[x, y, z, roll, pitch, yaw, gripper]``."""
+    pos, rot, grip = split_pose10d(pose10d)
+    return torch.cat((pos, matrix_to_euler_rpy(rot), grip), dim=-1)
+
+
 def split_pose10d(pose: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     """Split pose10d into position, rotation matrix, and gripper width."""
     if pose.shape[-1] != 10:

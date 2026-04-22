@@ -10,6 +10,7 @@ CAN_NAME="${CAN_NAME:-can0}"
 FPS="${FPS:-30}"
 CHUNK="${CHUNK:-20}"
 MAX_REL="${MAX_REL:-0.01}"  # meters / radians per step; tune for safety!
+PRETRAINED="${PRETRAINED:-outputs/async_piper/pose_act_random}"
 # UVC fisheye device path. Prefer udev symlinks (e.g. /dev/video60 created by pika_ros
 # scripts/start_single_gripper.bash) over raw indices so it survives re-plug / reboot.
 FISHEYE_DEV="${FISHEYE_DEV:-/dev/video60}"
@@ -22,11 +23,11 @@ exec python -m lerobot.async_inference.robot_client \
   --robot.max_relative_target="${MAX_REL}" \
   --robot.cameras="{ fisheye_rgb: {type: opencv, index_or_path: \"${FISHEYE_DEV}\", width: 640, height: 480, fps: 30} }" \
   --policy_type=pose_act \
-  --pretrained_name_or_path=shell \
+  --pretrained_name_or_path="${PRETRAINED}" \
   --policy_device=cpu \
   --client_device=cpu \
   --actions_per_chunk="${CHUNK}" \
   --chunk_size_threshold=0.5 \
   --aggregate_fn_name=latest_only \
   --fps="${FPS}" \
-  --task=pose_act_shell
+  --task=pose_act_random

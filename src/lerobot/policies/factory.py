@@ -74,11 +74,20 @@ def _reconnect_relative_absolute_steps(
     That reference is not serializable, so we re-establish it here after loading.
     """
     relative_step = next((s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)), None)
-    if relative_step is None:
-        return
-    for step in postprocessor.steps:
-        if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
-            step.relative_step = relative_step
+    if relative_step is not None:
+        for step in postprocessor.steps:
+            if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
+                step.relative_step = relative_step
+
+    from .pose_act.processor_pose_act import AbsolutePoseActionProcessorStep, RelativePoseActionProcessorStep
+
+    pose_relative_step = next(
+        (s for s in preprocessor.steps if isinstance(s, RelativePoseActionProcessorStep)), None
+    )
+    if pose_relative_step is not None:
+        for step in postprocessor.steps:
+            if isinstance(step, AbsolutePoseActionProcessorStep) and step.relative_step is None:
+                step.relative_step = pose_relative_step
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -335,17 +344,17 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    elif isinstance(policy_cfg, ACTConfig):
-        from .act.processor_act import make_act_pre_post_processors
-
-        processors = make_act_pre_post_processors(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
     elif isinstance(policy_cfg, PoseACTConfig):
         from .pose_act.processor_pose_act import make_pose_act_pre_post_processors
 
         processors = make_pose_act_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+    elif isinstance(policy_cfg, ACTConfig):
+        from .act.processor_act import make_act_pre_post_processors
+
+        processors = make_act_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
