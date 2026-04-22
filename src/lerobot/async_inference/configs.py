@@ -99,6 +99,14 @@ class PolicyServerConfig:
             "postprocessing, then replace returned pose7d actions with the client's current pose7d."
         },
     )
+    pose_act_safe_return_motion: str = field(
+        default="hold",
+        metadata={
+            "help": "Motion used with pose_act_safe_return_current_pose. 'hold' returns the current pose; "
+            "'small_x_osc_gripper' returns a small absolute pose7d chunk that drifts along +x and "
+            "oscillates the gripper."
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""

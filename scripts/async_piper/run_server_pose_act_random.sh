@@ -8,6 +8,7 @@ SERVER_PORT="${SERVER_PORT:-8080}"
 FPS="${FPS:-30}"
 LATENCY="${LATENCY:-0.0}"
 SAFE_RETURN="${SAFE_RETURN:-true}"
+SAFE_MOTION="${SAFE_MOTION:-small_x_osc_gripper}"
 
 exec python -m lerobot.async_inference.policy_server \
   --host="${SERVER_HOST}" \
@@ -15,4 +16,5 @@ exec python -m lerobot.async_inference.policy_server \
   --fps="${FPS}" \
   --inference_latency="${LATENCY}" \
   --obs_queue_timeout=2 \
-  --pose_act_safe_return_current_pose="${SAFE_RETURN}"
+  --pose_act_safe_return_current_pose="${SAFE_RETURN}" \
+  --pose_act_safe_return_motion="${SAFE_MOTION}"

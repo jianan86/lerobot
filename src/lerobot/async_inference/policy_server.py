@@ -450,23 +450,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         pose_convert_time = time.perf_counter() - start_pose_convert
 
         if self.config.pose_act_safe_return_current_pose:
-            state7d = observation_t.get_observation()
-            current_pose7d = torch.tensor(
-                [
-                    state7d["x"],
-                    state7d["y"],
-                    state7d["z"],
-                    state7d["roll"],
-                    state7d["pitch"],
-                    state7d["yaw"],
-                    state7d["gripper_width"],
-                ],
-                dtype=torch.float32,
+            action_tensor = self._build_pose_act_safe_return_pose7d_chunk(
+                observation_t, action_tensor.shape[0]
             )
-            action_tensor = current_pose7d.unsqueeze(0).repeat(action_tensor.shape[0], 1)
             self.logger.warning(
                 "PoseACT safe return enabled: real inference/postprocess completed, "
-                "but returned actions are overwritten with current pose7d."
+                f"but returned actions are overwritten with {self.config.pose_act_safe_return_motion} pose7d."
             )
 
         action_chunk = self._time_action_chunk(
@@ -482,6 +471,48 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"total={total_time * 1000:.2f}ms action_shape={tuple(action_tensor.shape)}"
         )
         return action_chunk
+
+    def _current_pose7d_from_raw_observation(self, observation_t: TimedObservation) -> torch.Tensor:
+        raw_obs = observation_t.get_observation()
+        return torch.tensor(
+            [
+                raw_obs["x"],
+                raw_obs["y"],
+                raw_obs["z"],
+                raw_obs["roll"],
+                raw_obs["pitch"],
+                raw_obs["yaw"],
+                raw_obs["gripper_width"],
+            ],
+            dtype=torch.float32,
+        )
+
+    def _build_pose_act_safe_return_pose7d_chunk(
+        self, observation_t: TimedObservation, chunk_size: int
+    ) -> torch.Tensor:
+        current_pose7d = self._current_pose7d_from_raw_observation(observation_t)
+        if self.config.pose_act_safe_return_motion == "hold":
+            return current_pose7d.unsqueeze(0).repeat(chunk_size, 1)
+
+        if self.config.pose_act_safe_return_motion != "small_x_osc_gripper":
+            self.logger.warning(
+                f"Unknown pose_act_safe_return_motion='{self.config.pose_act_safe_return_motion}', "
+                "falling back to hold."
+            )
+            return current_pose7d.unsqueeze(0).repeat(chunk_size, 1)
+
+        # Absolute pose7d targets. With the client's latest_only aggregation, the first action
+        # usually executes, so every chunk element carries the same small +x offset.
+        chunk = current_pose7d.unsqueeze(0).repeat(chunk_size, 1)
+        chunk[:, 0] = current_pose7d[0] + 0.003
+
+        if self._shell_t0 is None:
+            self._shell_t0 = observation_t.get_timestamp()
+        base_t = observation_t.get_timestamp() - self._shell_t0
+        for i in range(chunk_size):
+            t = base_t + i * self.config.environment_dt
+            chunk[i, 6] = max(0.0, 0.02 + 0.01 * math.sin(2.0 * math.pi * 0.5 * t))
+        return chunk
 
     def _pose_act_shell_predict(self, observation_t: TimedObservation) -> list[TimedAction]:
         """Shell path for pose_act / dummy modes.
