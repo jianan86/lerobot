@@ -26,8 +26,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.policies.pose_act.utils import matrix_to_rotation_6d
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STATE
+from lerobot.utils.pose_act import matrix_to_rotation_6d
 from lerobot.utils.rotation import Rotation
 
 

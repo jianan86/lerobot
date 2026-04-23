@@ -15,24 +15,26 @@
 # limitations under the License.
 
 """
-Convert a single UMI episode directory into a local LeRobotDataset v3.0 dataset.
+Convert a directory of UMI episodes into a local LeRobotDataset v3.0 dataset.
+
+Each direct child directory under the input root is treated as one UMI episode
+and is appended as one LeRobot episode in the output dataset.
 
 The converter intentionally targets the stable modalities confirmed in the sample
 UMI episode layout:
 
-- camera/color/pikaDepthCamera      -> observation.images.depth_camera_rgb
-- camera/color/pikaFisheyeCamera    -> observation.images.fisheye_rgb
-- camera/depth/pikaDepthCamera      -> observation.depth.depth_camera
-- localization/pose/pika            -> observation.state[:9]
-- gripper/encoder/pika              -> observation.state[9]
+- camera/color/pikaFisheyeCamera    -> observation.images.fisheye_rgb (default)
+- camera/color/pikaDepthCamera      -> observation.images.depth_camera_rgb (optional)
+- camera/depth/pikaDepthCamera      -> observation.depth.depth_camera (optional)
+- localization/pose/pika            -> observation.state[:6]
+- gripper/encoder/pika              -> observation.state[6]
 
-The generated dataset contains one episode. Since the sample data does not
-include a separate robot control stream, `action` defaults to the same 10D
-pose_act-ready vector as `observation.state`:
+Since the sample data does not include a separate robot control stream,
+`action` defaults to the same 7D raw pose vector as `observation.state`:
 
 - xyz position (3)
-- rotation_6d (6), converted from UMI roll/pitch/yaw using XYZ Euler order
-- gripper distance (1)
+- roll/pitch/yaw (3)
+- gripper width (1)
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import shutil
 from pathlib import Path
 from typing import Any
@@ -47,28 +50,39 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-DEFAULT_INPUT_EPISODE = Path("/home/jianan/workspace/data/episode1")
-DEFAULT_OUTPUT_ROOT = Path("/home/jianan/workspace/data/lerobot_umi_episode1_v30")
-DEFAULT_REPO_ID = "local/umi-episode1-v30"
+DEFAULT_INPUT_ROOT = Path("/home/jianan/workspace/data/0421")
+DEFAULT_OUTPUT_ROOT = Path("/home/jianan/workspace/data/lerobot_umi_0421_v30")
+DEFAULT_REPO_ID = "local/umi-0421-v30"
 DEFAULT_TASK = "umi episode"
+DEFAULT_CAMERAS = ("fisheye_rgb",)
+CAMERA_STORAGE_CHOICES = ("image", "video")
 
 DEPTH_CAMERA_DIR = Path("camera/color/pikaDepthCamera")
 FISHEYE_CAMERA_DIR = Path("camera/color/pikaFisheyeCamera")
 DEPTH_DIR = Path("camera/depth/pikaDepthCamera")
 POSE_DIR = Path("localization/pose/pika")
 GRIPPER_DIR = Path("gripper/encoder/pika")
-POSE10D_NAMES = [
+POSE7D_NAMES = [
     "x",
     "y",
     "z",
-    "rot6d_0",
-    "rot6d_1",
-    "rot6d_2",
-    "rot6d_3",
-    "rot6d_4",
-    "rot6d_5",
-    "gripper",
+    "roll",
+    "pitch",
+    "yaw",
+    "gripper_width",
 ]
+RGB_CAMERA_DIRS = {
+    "depth_camera_rgb": DEPTH_CAMERA_DIR,
+    "fisheye_rgb": FISHEYE_CAMERA_DIR,
+}
+RGB_CAMERA_FEATURES = {
+    "depth_camera_rgb": "observation.images.depth_camera_rgb",
+    "fisheye_rgb": "observation.images.fisheye_rgb",
+}
+DEPTH_CAMERA = "depth_camera"
+DEPTH_CAMERA_FEATURE = "observation.depth.depth_camera"
+SUPPORTED_CAMERAS = tuple([*RGB_CAMERA_DIRS, DEPTH_CAMERA])
+
 
 def load_synced_files(directory: Path) -> list[Path]:
     if not directory.exists():
@@ -90,7 +104,9 @@ def load_synced_files(directory: Path) -> list[Path]:
             try:
                 float(path.stem)
             except ValueError as exc:
-                raise ValueError(f"Synced file name must start with a numeric timestamp: {path.name}") from exc
+                raise ValueError(
+                    f"Synced file name must start with a numeric timestamp: {path.name}"
+                ) from exc
             files.append(path)
 
     if not files:
@@ -158,10 +174,7 @@ def load_depth_image(path: Path) -> np.ndarray:
 def build_state_vector(pose_path: Path, gripper_path: Path) -> np.ndarray:
     pose = load_pose_json(pose_path)
     _, gripper_distance = load_gripper_json(gripper_path)
-    pos = pose[:3]
-    rot_mat = euler_xyz_to_rotation_matrix(*pose[3:])
-    rot6d = rotation_matrix_to_rot6d(rot_mat)
-    return np.concatenate([pos, rot6d, np.array([gripper_distance], dtype=np.float32)]).astype(np.float32)
+    return np.concatenate([pose, np.array([gripper_distance], dtype=np.float32)]).astype(np.float32)
 
 
 def get_episode_task(instructions_path: Path, task_override: str | None = None) -> str:
@@ -193,25 +206,112 @@ def _extract_instruction_strings(payload: Any) -> list[str]:
         return values
     if isinstance(payload, dict):
         values: list[str] = []
-        for key in ("instruction", "instructions", "task", "tasks", "full-instructions", "segment-instructions"):
+        instruction_keys = (
+            "instruction",
+            "instructions",
+            "task",
+            "tasks",
+            "full-instructions",
+            "segment-instructions",
+        )
+        for key in instruction_keys:
             if key in payload:
                 values.extend(_extract_instruction_strings(payload[key]))
         return values
     return []
 
 
-def infer_features(depth_camera_rgb: Path, fisheye_rgb: Path, depth_image: Path) -> dict[str, dict[str, Any]]:
-    depth_rgb_shape = _get_rgb_feature_shape(depth_camera_rgb)
-    fisheye_rgb_shape = _get_rgb_feature_shape(fisheye_rgb)
-    depth_array = load_depth_image(depth_image)
+def parse_cameras(cameras: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    if cameras is None:
+        return DEFAULT_CAMERAS
 
-    return {
-        "observation.images.depth_camera_rgb": {"dtype": "image", "shape": depth_rgb_shape, "names": None},
-        "observation.images.fisheye_rgb": {"dtype": "image", "shape": fisheye_rgb_shape, "names": None},
-        "observation.depth.depth_camera": {"dtype": str(depth_array.dtype), "shape": depth_array.shape, "names": None},
-        "observation.state": {"dtype": "float32", "shape": (10,), "names": POSE10D_NAMES},
-        "action": {"dtype": "float32", "shape": (10,), "names": POSE10D_NAMES},
+    if isinstance(cameras, str):
+        raw_items = [item.strip() for item in cameras.split(",")]
+    else:
+        raw_items = [str(item).strip() for item in cameras]
+
+    selected = tuple(item for item in raw_items if item)
+    if len(selected) == 1 and selected[0].lower() == "none":
+        return ()
+
+    invalid = sorted(set(selected) - set(SUPPORTED_CAMERAS))
+    if invalid:
+        raise ValueError(f"Unsupported camera(s): {invalid}. Supported cameras: {sorted(SUPPORTED_CAMERAS)}")
+    if len(set(selected)) != len(selected):
+        raise ValueError(f"Duplicate cameras are not supported: {selected}")
+    return selected
+
+
+def infer_features(
+    modality_files: dict[str, list[Path]],
+    cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
+    camera_storage: str = "image",
+) -> dict[str, dict[str, Any]]:
+    selected_cameras = parse_cameras(cameras)
+    if camera_storage not in CAMERA_STORAGE_CHOICES:
+        raise ValueError(
+            f"Unsupported camera storage {camera_storage!r}. Choose from {CAMERA_STORAGE_CHOICES}."
+        )
+
+    features: dict[str, dict[str, Any]] = {}
+    for camera in selected_cameras:
+        if camera in RGB_CAMERA_FEATURES:
+            features[RGB_CAMERA_FEATURES[camera]] = {
+                "dtype": camera_storage,
+                "shape": _get_rgb_feature_shape(modality_files[camera][0]),
+                "names": None,
+            }
+        elif camera == DEPTH_CAMERA:
+            depth_array = load_depth_image(modality_files[camera][0])
+            features[DEPTH_CAMERA_FEATURE] = {
+                "dtype": str(depth_array.dtype),
+                "shape": depth_array.shape,
+                "names": None,
+            }
+
+    features.update(
+        {
+            "observation.state": {"dtype": "float32", "shape": (7,), "names": POSE7D_NAMES},
+            "action": {"dtype": "float32", "shape": (7,), "names": POSE7D_NAMES},
+        }
+    )
+    return features
+
+
+def camera_features_use_video(features: dict[str, dict[str, Any]]) -> bool:
+    return any(feature["dtype"] == "video" for feature in features.values())
+
+
+def add_camera_frame_data(
+    frame: dict[str, Any],
+    modality_files: dict[str, list[Path]],
+    cameras: tuple[str, ...],
+    frame_idx: int,
+) -> None:
+    for camera in cameras:
+        if camera in RGB_CAMERA_FEATURES:
+            frame[RGB_CAMERA_FEATURES[camera]] = load_rgb_image(modality_files[camera][frame_idx])
+        elif camera == DEPTH_CAMERA:
+            frame[DEPTH_CAMERA_FEATURE] = load_depth_image(modality_files[camera][frame_idx])
+
+
+def discover_episode_files(
+    episode_dir: Path,
+    cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
+) -> dict[str, list[Path]]:
+    selected_cameras = parse_cameras(cameras)
+    files = {
+        "pose": load_synced_files(episode_dir / POSE_DIR),
+        "gripper": load_synced_files(episode_dir / GRIPPER_DIR),
     }
+
+    for camera in selected_cameras:
+        if camera in RGB_CAMERA_DIRS:
+            files[camera] = load_synced_files(episode_dir / RGB_CAMERA_DIRS[camera])
+        elif camera == DEPTH_CAMERA:
+            files[camera] = load_synced_files(episode_dir / DEPTH_DIR)
+
+    return files
 
 
 def _get_rgb_feature_shape(path: Path) -> tuple[int, int, int]:
@@ -232,13 +332,79 @@ def compute_aligned_length(modality_files: dict[str, list[Path]]) -> int:
     return aligned_length
 
 
-def discover_episode_files(episode_dir: Path) -> dict[str, list[Path]]:
+def parse_frame_range(frame_range: tuple[float, float] | list[float] | None) -> tuple[float, float]:
+    if frame_range is None:
+        return (0.0, 1.0)
+    if len(frame_range) != 2:
+        raise ValueError(f"Expected frame range to contain START and END, got {frame_range}")
+
+    start, end = float(frame_range[0]), float(frame_range[1])
+    if not 0.0 <= start < end <= 1.0:
+        raise ValueError(f"Frame range must satisfy 0.0 <= START < END <= 1.0, got {(start, end)}")
+    return (start, end)
+
+
+def resolve_frame_slice(
+    total_frames: int,
+    frame_range: tuple[float, float] | list[float] | None,
+) -> tuple[int, int]:
+    start_ratio, end_ratio = parse_frame_range(frame_range)
+    start_idx = math.floor(total_frames * start_ratio)
+    end_idx = math.floor(total_frames * end_ratio)
+    if end_idx <= start_idx:
+        raise ValueError(
+            f"Frame range {(start_ratio, end_ratio)} selects no frames from aligned length {total_frames}"
+        )
+    return start_idx, end_idx
+
+
+def add_episode_to_dataset(
+    dataset: Any,
+    input_episode: Path,
+    task: str | None = None,
+    cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
+    camera_storage: str = "image",
+    frame_range: tuple[float, float] | list[float] | None = None,
+) -> dict[str, Any]:
+    input_episode = Path(input_episode)
+    selected_cameras = parse_cameras(cameras)
+    modality_files = discover_episode_files(input_episode, cameras=selected_cameras)
+    aligned_length = compute_aligned_length(modality_files)
+    source_frame_start, source_frame_end = resolve_frame_slice(aligned_length, frame_range)
+    selected_frame_count = source_frame_end - source_frame_start
+    parsed_frame_range = parse_frame_range(frame_range)
+    task_text = get_episode_task(input_episode / "instructions.json", task_override=task)
+
+    logging.info(
+        "Detected modality counts for %s: %s",
+        input_episode,
+        {name: len(files) for name, files in modality_files.items()},
+    )
+    logging.info("Using aligned frame count: %s", aligned_length)
+    logging.info("Using source frame range: [%s, %s)", source_frame_start, source_frame_end)
+
+    for frame_idx in range(source_frame_start, source_frame_end):
+        state = build_state_vector(modality_files["pose"][frame_idx], modality_files["gripper"][frame_idx])
+        frame = {
+            "task": task_text,
+            "observation.state": state,
+            "action": state.copy(),
+        }
+        add_camera_frame_data(frame, modality_files, selected_cameras, frame_idx)
+        dataset.add_frame(frame)
+
+    dataset.save_episode()
+
     return {
-        "depth_camera_rgb": load_synced_files(episode_dir / DEPTH_CAMERA_DIR),
-        "fisheye_rgb": load_synced_files(episode_dir / FISHEYE_CAMERA_DIR),
-        "depth_camera_depth": load_synced_files(episode_dir / DEPTH_DIR),
-        "pose": load_synced_files(episode_dir / POSE_DIR),
-        "gripper": load_synced_files(episode_dir / GRIPPER_DIR),
+        "input_episode": str(input_episode),
+        "aligned_frames": aligned_length,
+        "selected_frames": selected_frame_count,
+        "frame_range": parsed_frame_range,
+        "source_frame_start": source_frame_start,
+        "source_frame_end": source_frame_end,
+        "task": task_text,
+        "cameras": selected_cameras,
+        "camera_storage": camera_storage,
     }
 
 
@@ -250,45 +416,45 @@ def convert_episode(
     task: str | None = None,
     use_videos: bool = False,
     overwrite: bool = False,
+    cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
+    camera_storage: str = "image",
+    frame_range: tuple[float, float] | list[float] | None = None,
 ) -> dict[str, Any]:
     from lerobot.datasets import LeRobotDataset
 
     input_episode = Path(input_episode)
     output_root = Path(output_root)
+    selected_cameras = parse_cameras(cameras)
+    if use_videos:
+        camera_storage = "video"
 
-    modality_files = discover_episode_files(input_episode)
-    aligned_length = compute_aligned_length(modality_files)
-    task_text = get_episode_task(input_episode / "instructions.json", task_override=task)
-    features = infer_features(
-        modality_files["depth_camera_rgb"][0],
-        modality_files["fisheye_rgb"][0],
-        modality_files["depth_camera_depth"][0],
-    )
+    modality_files = discover_episode_files(input_episode, cameras=selected_cameras)
+    features = infer_features(modality_files, cameras=selected_cameras, camera_storage=camera_storage)
 
     if output_root.exists():
         if not overwrite:
-            raise FileExistsError(f"Output root already exists: {output_root}. Pass --overwrite to replace it.")
+            raise FileExistsError(
+                f"Output root already exists: {output_root}. Pass --overwrite to replace it."
+            )
         shutil.rmtree(output_root)
 
-    logging.info("Detected modality counts: %s", {name: len(files) for name, files in modality_files.items()})
-    logging.info("Using aligned frame count: %s", aligned_length)
-
-    dataset = LeRobotDataset.create(repo_id=repo_id, fps=fps, features=features, root=output_root, use_videos=use_videos)
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=fps,
+        features=features,
+        root=output_root,
+        use_videos=camera_features_use_video(features),
+    )
 
     try:
-        for frame_idx in range(aligned_length):
-            state = build_state_vector(modality_files["pose"][frame_idx], modality_files["gripper"][frame_idx])
-            frame = {
-                "task": task_text,
-                "observation.images.depth_camera_rgb": load_rgb_image(modality_files["depth_camera_rgb"][frame_idx]),
-                "observation.images.fisheye_rgb": load_rgb_image(modality_files["fisheye_rgb"][frame_idx]),
-                "observation.depth.depth_camera": load_depth_image(modality_files["depth_camera_depth"][frame_idx]),
-                "observation.state": state,
-                "action": state.copy(),
-            }
-            dataset.add_frame(frame)
-
-        dataset.save_episode()
+        episode_manifest = add_episode_to_dataset(
+            dataset,
+            input_episode=input_episode,
+            task=task,
+            cameras=selected_cameras,
+            camera_storage=camera_storage,
+            frame_range=frame_range,
+        )
         dataset.finalize()
     except Exception:
         dataset.finalize()
@@ -299,20 +465,144 @@ def convert_episode(
         "input_episode": str(input_episode),
         "output_root": str(output_root),
         "fps": fps,
-        "aligned_frames": aligned_length,
-        "task": task_text,
+        **episode_manifest,
         "features": features,
+    }
+
+
+def discover_episode_dirs(input_root: Path) -> list[Path]:
+    input_root = Path(input_root)
+    if not input_root.is_dir():
+        raise NotADirectoryError(f"Input root is not a directory: {input_root}")
+
+    episode_dirs = sorted(path for path in input_root.iterdir() if path.is_dir())
+    if not episode_dirs:
+        raise ValueError(f"No episode subdirectories found under: {input_root}")
+    return episode_dirs
+
+
+def convert_episodes(
+    input_root: Path,
+    output_root: Path,
+    repo_id: str = DEFAULT_REPO_ID,
+    fps: int = 30,
+    task: str | None = None,
+    use_videos: bool = False,
+    overwrite: bool = False,
+    cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
+    camera_storage: str = "image",
+    frame_range: tuple[float, float] | list[float] | None = None,
+) -> dict[str, Any]:
+    from lerobot.datasets import LeRobotDataset
+
+    input_root = Path(input_root)
+    output_root = Path(output_root)
+    selected_cameras = parse_cameras(cameras)
+    if use_videos:
+        camera_storage = "video"
+
+    episode_dirs = discover_episode_dirs(input_root)
+    first_modality_files = discover_episode_files(episode_dirs[0], cameras=selected_cameras)
+    features = infer_features(first_modality_files, cameras=selected_cameras, camera_storage=camera_storage)
+
+    if output_root.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"Output root already exists: {output_root}. Pass --overwrite to replace it."
+            )
+        shutil.rmtree(output_root)
+
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=fps,
+        features=features,
+        root=output_root,
+        use_videos=camera_features_use_video(features),
+    )
+
+    episode_manifests: list[dict[str, Any]] = []
+    try:
+        for episode_dir in episode_dirs:
+            logging.info("Converting episode: %s", episode_dir)
+            episode_manifests.append(
+                add_episode_to_dataset(
+                    dataset,
+                    input_episode=episode_dir,
+                    task=task,
+                    cameras=selected_cameras,
+                    camera_storage=camera_storage,
+                    frame_range=frame_range,
+                )
+            )
+        dataset.finalize()
+    except Exception:
+        dataset.finalize()
+        raise
+
+    return {
+        "repo_id": repo_id,
+        "input_root": str(input_root),
+        "output_root": str(output_root),
+        "fps": fps,
+        "total_episodes": len(episode_manifests),
+        "total_selected_frames": sum(item["selected_frames"] for item in episode_manifests),
+        "cameras": selected_cameras,
+        "camera_storage": camera_storage,
+        "features": features,
+        "episodes": episode_manifests,
     }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-episode", type=Path, default=DEFAULT_INPUT_EPISODE, help="Path to a single UMI episode directory.")
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Output root for the local LeRobotDataset v3.0 dataset.")
-    parser.add_argument("--repo-id", default=DEFAULT_REPO_ID, help="Repo id recorded in the generated local LeRobot dataset metadata.")
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=DEFAULT_INPUT_ROOT,
+        help="Directory whose direct child directories are UMI episodes.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help="Output root for the local LeRobotDataset v3.0 dataset.",
+    )
+    parser.add_argument(
+        "--repo-id",
+        default=DEFAULT_REPO_ID,
+        help="Repo id recorded in the generated local LeRobot dataset metadata.",
+    )
     parser.add_argument("--fps", type=int, default=30, help="Dataset FPS recorded in metadata.")
     parser.add_argument("--task", help="Optional task text override.")
-    parser.add_argument("--use-videos", action="store_true", help="Store visual observations as videos instead of images.")
+    parser.add_argument(
+        "--frame-range",
+        nargs=2,
+        type=float,
+        metavar=("START", "END"),
+        help=(
+            "Convert only the half-open fractional frame range [START, END), "
+            "where 0.0 <= START < END <= 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--cameras",
+        default=",".join(DEFAULT_CAMERAS),
+        help=(
+            f"Comma-separated cameras to convert. Supported: {', '.join(SUPPORTED_CAMERAS)}. "
+            "Use 'none' for no cameras."
+        ),
+    )
+    parser.add_argument(
+        "--camera-storage",
+        choices=CAMERA_STORAGE_CHOICES,
+        default="image",
+        help="Store RGB camera observations as parquet images or encoded videos. Depth stays a uint16 array.",
+    )
+    parser.add_argument(
+        "--use-videos",
+        action="store_true",
+        help="Deprecated alias for --camera-storage video.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output dataset root.")
     return parser
 
@@ -320,14 +610,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = build_parser().parse_args()
-    manifest = convert_episode(
-        input_episode=args.input_episode,
+    manifest = convert_episodes(
+        input_root=args.input_root,
         output_root=args.output_root,
         repo_id=args.repo_id,
         fps=args.fps,
         task=args.task,
         use_videos=args.use_videos,
         overwrite=args.overwrite,
+        cameras=args.cameras,
+        camera_storage=args.camera_storage,
+        frame_range=args.frame_range,
     )
     print(json.dumps(manifest, indent=2))
 

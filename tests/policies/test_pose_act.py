@@ -66,6 +66,25 @@ def test_pose_act_pose7d_pose10d_roundtrip():
     torch.testing.assert_close(restored, pose7d, rtol=0, atol=1e-6)
 
 
+def test_pose_act_accepts_pose7d_features():
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        input_features={
+            "observation.images.front": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+    policy = PoseACTPolicy(config)
+    infer_batch = {
+        "observation.images.front": torch.randn(1, 3, 32, 32),
+        OBS_STATE: torch.randn(1, 7),
+    }
+    action = policy.select_action(infer_batch)
+    assert action.shape == (1, 10)
+
+
 def test_pose_act_factory_uses_pose_processors(tmp_path):
     config = PoseACTConfig(
         device="cpu",

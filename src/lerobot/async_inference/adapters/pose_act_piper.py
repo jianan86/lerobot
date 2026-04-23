@@ -18,7 +18,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from lerobot.policies.pose_act.utils import (
+from lerobot.utils.pose_act import (
     absolute_pose10d,
     pose10d_to_pose7d,
     pose7d_to_pose10d,
@@ -27,7 +27,6 @@ from lerobot.policies.pose_act.utils import (
 logger = logging.getLogger(__name__)
 
 _IDENTITY_ROT6D = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-POSE7D_NAMES = ("x", "y", "z", "roll", "pitch", "yaw", "gripper_width")
 
 
 def is_pose_act_piper(policy_type: str, robot_type: str) -> bool:

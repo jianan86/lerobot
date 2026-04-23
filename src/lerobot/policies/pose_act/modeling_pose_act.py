@@ -24,12 +24,11 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.pose_act import ensure_pose10d, make_relative_state_history
 
 from ..act.modeling_act import ACT, ACTTemporalEnsembler
 from ..pretrained import PreTrainedPolicy
 from .configuration_pose_act import PoseACTConfig
-from .utils import make_relative_state_history
-
 
 class PoseACTPolicy(PreTrainedPolicy):
     """ACT-style policy over relative TCP pose chunks with observation history."""
@@ -44,10 +43,14 @@ class PoseACTPolicy(PreTrainedPolicy):
 
         model_config = deepcopy(config)
         if model_config.robot_state_feature is not None:
-            step_dim = model_config.robot_state_feature.shape[0]
+            step_dim = 10
             model_config.input_features = dict(model_config.input_features or {})
             model_config.input_features[OBS_STATE] = deepcopy(model_config.robot_state_feature)
             model_config.input_features[OBS_STATE].shape = (step_dim * config.n_obs_steps,)
+        if model_config.action_feature is not None:
+            model_config.output_features = dict(model_config.output_features or {})
+            model_config.output_features[ACTION] = deepcopy(model_config.action_feature)
+            model_config.output_features[ACTION].shape = (10,)
         self.model = ACT(model_config)
 
         if config.temporal_ensemble_coeff is not None:
@@ -92,7 +95,11 @@ class PoseACTPolicy(PreTrainedPolicy):
             raise ValueError(
                 f"pose_act expects {self.config.n_obs_steps} state steps, got shape {tuple(state.shape)}"
             )
-        batch[OBS_STATE] = make_relative_state_history(state).flatten(start_dim=1)
+        if state.shape[-1] == 7:
+            state = make_relative_state_history(ensure_pose10d(state))
+        elif state.shape[-1] != 10:
+            raise ValueError(f"pose_act expects pose7d or pose10d state, got shape {tuple(state.shape)}")
+        batch[OBS_STATE] = state.flatten(start_dim=1)
 
         batch[OBS_IMAGES] = []
         for key in self.config.image_features:

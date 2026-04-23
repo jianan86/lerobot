@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from lerobot.configs import NormalizationMode
 from lerobot.configs import PreTrainedConfig
 
 from ..act.configuration_act import ACTConfig
@@ -29,6 +30,14 @@ class PoseACTConfig(ACTConfig):
     n_obs_steps: int = 2
     img_obs_horizon: int = 2
     image_feature_key: str | None = None
+    use_pose_normalization: bool = True
+    normalization_mapping: dict[str, NormalizationMode] = field(
+        default_factory=lambda: {
+            "VISUAL": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
+    )
 
     def __post_init__(self):
         # Keep a single source of truth for image/state history in v1.
@@ -59,6 +68,16 @@ class PoseACTConfig(ACTConfig):
             raise ValueError("pose_act requires `observation.state` as TCP proprioception input.")
         if not self.action_feature:
             raise ValueError("pose_act requires an `action` output feature.")
+        if self.robot_state_feature.shape[0] not in (7, 10):
+            raise ValueError(
+                "pose_act expects observation.state to be pose7d or pose10d. "
+                f"Got {self.robot_state_feature.shape[0]}."
+            )
+        if self.action_feature.shape[0] not in (7, 10):
+            raise ValueError(
+                "pose_act expects action to be pose7d or pose10d. "
+                f"Got {self.action_feature.shape[0]}."
+            )
         if self.robot_state_feature.shape[0] != self.action_feature.shape[0]:
             raise ValueError(
                 "pose_act expects observation.state and action to share the same per-step pose dimension. "

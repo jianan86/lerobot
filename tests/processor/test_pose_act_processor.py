@@ -7,6 +7,7 @@ from lerobot.policies.pose_act.configuration_pose_act import PoseACTConfig
 from lerobot.policies.pose_act.processor_pose_act import make_pose_act_pre_post_processors
 from lerobot.processor.converters import create_transition, transition_to_batch
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.pose_act import pose7d_to_pose10d
 
 
 def create_pose_act_config():
@@ -55,3 +56,31 @@ def test_pose_act_processor_relative_absolute_roundtrip():
     restored = postprocessor(processed[ACTION])
 
     torch.testing.assert_close(restored.squeeze(0), action, rtol=0, atol=1e-5)
+
+
+def test_pose_act_processor_converts_pose7d_to_relative_pose10d():
+    config = create_pose_act_config()
+    config.use_pose_normalization = False
+    preprocessor, _ = make_pose_act_pre_post_processors(config, create_pose_act_stats())
+
+    observation = {
+        OBS_STATE: torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2],
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3],
+            ]
+        ),
+        "observation.images.front": torch.randn(2, 3, 32, 32),
+    }
+    action = torch.tensor([1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.35])
+
+    processed = preprocessor(transition_to_batch(create_transition(observation, action)))
+
+    assert processed[OBS_STATE].shape == (2, 10)
+    assert processed[ACTION].shape == (1, 10)
+    torch.testing.assert_close(
+        processed[OBS_STATE][-1],
+        pose7d_to_pose10d(torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3])),
+        rtol=0,
+        atol=1e-6,
+    )
