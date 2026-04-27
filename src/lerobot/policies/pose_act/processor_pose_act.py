@@ -205,7 +205,10 @@ class AbsolutePoseActionProcessorStep(ProcessorStep):
             return transition
 
         new_transition = transition.copy()
-        new_transition[TransitionKey.ACTION] = absolute_pose10d(action, self.relative_step._last_state)
+        base_pose = self.relative_step._last_state
+        if isinstance(base_pose, torch.Tensor) and isinstance(action, torch.Tensor) and base_pose.device != action.device:
+            base_pose = base_pose.to(device=action.device, dtype=action.dtype)
+        new_transition[TransitionKey.ACTION] = absolute_pose10d(action, base_pose)
         return new_transition
 
     def get_config(self) -> dict[str, Any]:

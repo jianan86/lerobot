@@ -85,8 +85,18 @@ class PoseACTPolicy(PreTrainedPolicy):
         for key in self.config.image_features:
             self._obs_queues[key] = deque([], maxlen=self.config.n_obs_steps)
 
+    def _model_device(self) -> torch.device:
+        return next(self.model.parameters()).device
+
+    def _move_batch_to_model_device(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        device = self._model_device()
+        moved: dict[str, Tensor] = {}
+        for key, value in batch.items():
+            moved[key] = value.to(device) if isinstance(value, torch.Tensor) else value
+        return moved
+
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        batch = dict(batch)
+        batch = self._move_batch_to_model_device(dict(batch))
 
         state = batch[OBS_STATE]
         if state.ndim == 2:

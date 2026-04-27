@@ -466,7 +466,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"PoseACT input state7d={state7d.tolist()} image_shapes={image_shapes}"
         )
 
-        prepared: Observation = {OBS_STATE: pose7d_to_pose10d(state7d.cpu())}
+        prepared: Observation = {OBS_STATE: pose7d_to_pose10d(state7d)}
         for key in self.policy.config.image_features:
             image = observation[key].to(torch.float32)
             if image.ndim == 4:
