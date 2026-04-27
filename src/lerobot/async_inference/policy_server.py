@@ -29,9 +29,9 @@ import math
 import pickle  # nosec
 import threading
 import time
-from collections import deque
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -61,7 +61,9 @@ from .helpers import (
     TimedObservation,
     get_logger,
     observations_similar,
+    prepare_image,
     raw_observation_to_observation,
+    resize_robot_observation_image,
 )
 
 
@@ -72,6 +74,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def __init__(self, config: PolicyServerConfig):
         self.config = config
         self.shutdown_event = threading.Event()
+        self._result_dump_root = config.result_dump_path
+        if self._result_dump_root is not None:
+            self._result_dump_root.mkdir(parents=True, exist_ok=True)
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=config.fps)
@@ -86,7 +91,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # State for pose_act shell motion generators (reset on each new client session).
         self._shell_step_count: int = 0
         self._shell_t0: float | None = None
-        self._pose_act_obs_history: dict[str, deque[torch.Tensor]] = {}
 
         # Attributes will be set by SendPolicyInstructions
         self.device = None
@@ -116,7 +120,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self._shell_step_count = 0
         self._shell_t0 = None
-        self._pose_act_obs_history = {}
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -273,6 +276,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             action_chunk = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
 
+            self._dump_pose_act_result(obs, action_chunk)
+
             start_time = time.perf_counter()
             actions_bytes = pickle.dumps(action_chunk)  # nosec
             serialize_time = time.perf_counter() - start_time
@@ -314,6 +319,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if obs.get_timestep() in predicted_timesteps:
             self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
             return False
+        if self.policy_type == "pose_act":
+            return True
 
         elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features):
             self.logger.debug(
@@ -360,6 +367,70 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
+    def _dump_pose_act_result(self, observation_t: TimedObservation, action_chunk: list[TimedAction]) -> Path | None:
+        if self.policy_type != "pose_act" or self._result_dump_root is None or len(action_chunk) == 0:
+            return None
+
+        raw_observation = observation_t.get_observation()
+        request_id = str(raw_observation.get("request_id") or f"ts-{observation_t.get_timestep():06d}")
+        dump_dir = self._result_dump_root / request_id
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = dump_dir / "result.pt"
+
+        action_tensor = torch.stack([step.get_action().detach().to(torch.float32).cpu() for step in action_chunk], dim=0)
+        action_timestamps = torch.tensor([step.get_timestamp() for step in action_chunk], dtype=torch.float64)
+        action_timesteps = torch.tensor([step.get_timestep() for step in action_chunk], dtype=torch.int64)
+
+        state = raw_observation.get(OBS_STATE)
+        if state is None:
+            state = torch.tensor(
+                [
+                    raw_observation["x"],
+                    raw_observation["y"],
+                    raw_observation["z"],
+                    raw_observation["roll"],
+                    raw_observation["pitch"],
+                    raw_observation["yaw"],
+                    raw_observation["gripper_width"],
+                ],
+                dtype=torch.float32,
+            ).unsqueeze(0)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32).cpu()
+
+        image_key = None
+        image = None
+        for key, value in raw_observation.items():
+            if key == OBS_STATE:
+                continue
+            if hasattr(value, "shape") and getattr(value, "ndim", 0) in (3, 4):
+                image_key = key
+                image = torch.as_tensor(value).cpu()
+                break
+
+        payload = {
+            "request_id": request_id,
+            "policy_type": self.policy_type,
+            "policy_device": self.device,
+            "actions": action_tensor,
+            "action_timestamps": action_timestamps,
+            "action_timesteps": action_timesteps,
+            "observation_timestamp": observation_t.get_timestamp(),
+            "observation_timestep": observation_t.get_timestep(),
+            "observation_state": state,
+            "observation_image_key": image_key,
+            "observation_image": image,
+            "task": raw_observation.get("task"),
+            "metadata": {
+                "actions_per_chunk": self.actions_per_chunk,
+                "environment_dt": self.config.environment_dt,
+                "result_path": str(dump_path),
+            },
+        }
+        torch.save(payload, dump_path)
+        self.logger.info(f"Dumped pose_act result to {dump_path}")
+        return dump_path
+
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
         chunk = self.policy.predict_action_chunk(observation)
@@ -376,22 +447,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             and state.shape[-1] == 7
         )
 
-    def _append_pose_act_history(self, key: str, value: torch.Tensor) -> None:
-        horizon = int(self.policy.config.n_obs_steps)
-        queue = self._pose_act_obs_history.setdefault(key, deque(maxlen=horizon))
-        value = value.detach().clone()
-        if len(queue) == 0:
-            queue.extend(value.clone() for _ in range(horizon))
-        else:
-            queue.append(value)
-
     def _prepare_pose_act_observation(self, observation: Observation) -> Observation:
-        """Convert base-frame pose7d observation to pose_act's batched pose10d history."""
-        state7d = observation[OBS_STATE]
+        """Convert client-supplied pose7d history into pose_act's batched pose10d history."""
+        state7d = observation[OBS_STATE].to(torch.float32)
         if state7d.ndim == 2:
-            state7d = state7d.squeeze(0)
-        if state7d.ndim != 1 or state7d.shape[0] != 7:
-            raise ValueError(f"pose_act async expects observation.state shape (7,), got {tuple(state7d.shape)}")
+            state7d = state7d.unsqueeze(0)
+        if state7d.ndim != 3 or state7d.shape[1] != self.policy.config.n_obs_steps or state7d.shape[2] != 7:
+            raise ValueError(
+                "pose_act async expects observation.state shape "
+                f"(B,{self.policy.config.n_obs_steps},7), got {tuple(state7d.shape)}"
+            )
 
         image_shapes = {}
         for key in self.policy.config.image_features:
@@ -401,32 +466,50 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"PoseACT input state7d={state7d.tolist()} image_shapes={image_shapes}"
         )
 
-        state10d = pose7d_to_pose10d(state7d.to(torch.float32).cpu())
-        self._append_pose_act_history(OBS_STATE, state10d)
-
+        prepared: Observation = {OBS_STATE: pose7d_to_pose10d(state7d.cpu())}
         for key in self.policy.config.image_features:
-            image = observation[key]
+            image = observation[key].to(torch.float32)
             if image.ndim == 4:
-                image = image.squeeze(0)
-            if image.ndim != 3:
-                raise ValueError(f"pose_act async expects image {key} shape (C,H,W), got {tuple(image.shape)}")
-            self._append_pose_act_history(key, image.to(torch.float32).cpu())
-
-        prepared: Observation = {
-            OBS_STATE: torch.stack(list(self._pose_act_obs_history[OBS_STATE]), dim=0).unsqueeze(0)
-        }
-        for key in self.policy.config.image_features:
-            prepared[key] = torch.stack(list(self._pose_act_obs_history[key]), dim=0).unsqueeze(0)
+                image = image.unsqueeze(0)
+            if image.ndim != 5 or image.shape[1] != self.policy.config.n_obs_steps:
+                raise ValueError(
+                    f"pose_act async expects image {key} shape (B,{self.policy.config.n_obs_steps},C,H,W), "
+                    f"got {tuple(image.shape)}"
+                )
+            prepared[key] = image
         if "task" in observation:
             prepared["task"] = observation["task"]
         return prepared
 
+    def _raw_pose_act_observation_to_observation(self, raw_observation: dict[str, Any]) -> Observation:
+        observation: Observation = {
+            OBS_STATE: torch.as_tensor(raw_observation[OBS_STATE], dtype=torch.float32)
+        }
+        for key in self.policy.config.image_features:
+            image_history = torch.as_tensor(raw_observation[key])
+            if image_history.ndim != 4 or image_history.shape[0] != self.policy.config.n_obs_steps:
+                raise ValueError(
+                    f"pose_act async expects raw image history {key} shape "
+                    f"({self.policy.config.n_obs_steps},H,W,C), got {tuple(image_history.shape)}"
+                )
+            resized = torch.stack(
+                [
+                    prepare_image(
+                        resize_robot_observation_image(image_history[t], self.policy.config.image_features[key].shape)
+                    )
+                    for t in range(self.policy.config.n_obs_steps)
+                ],
+                dim=0,
+            )
+            observation[key] = resized
+        if "task" in raw_observation:
+            observation["task"] = raw_observation["task"]
+        return observation
+
     def _predict_pose_act_pose7d_chunk(
         self, observation_t: TimedObservation, observation: Observation, start_prepare: float, prepare_time: float
     ) -> list[TimedAction]:
-        start_history = time.perf_counter()
         observation = self._prepare_pose_act_observation(observation)
-        history_time = time.perf_counter() - start_history
 
         start_preprocess = time.perf_counter()
         observation = self.preprocessor(observation)
@@ -465,7 +548,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.logger.info(
             f"PoseACT observation {observation_t.get_timestep()} | "
-            f"prepare={prepare_time * 1000:.2f}ms history={history_time * 1000:.2f}ms "
+            f"prepare={prepare_time * 1000:.2f}ms "
             f"preprocess={preprocessing_time * 1000:.2f}ms inference={inference_time * 1000:.2f}ms "
             f"postprocess={postprocessing_time * 1000:.2f}ms pose_convert={pose_convert_time * 1000:.2f}ms "
             f"total={total_time * 1000:.2f}ms action_shape={tuple(action_tensor.shape)}"
@@ -474,6 +557,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
     def _current_pose7d_from_raw_observation(self, observation_t: TimedObservation) -> torch.Tensor:
         raw_obs = observation_t.get_observation()
+        state = raw_obs.get(OBS_STATE)
+        if state is not None:
+            state = torch.as_tensor(state, dtype=torch.float32)
+            if state.ndim >= 2:
+                state = state[-1]
+            if state.shape != (7,):
+                raise ValueError(f"Expected pose_act raw observation.state to end with shape (7,), got {tuple(state.shape)}")
+            return state
         return torch.tensor(
             [
                 raw_obs["x"],
@@ -622,11 +713,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
-        observation: Observation = raw_observation_to_observation(
-            observation_t.get_observation(),
-            self.lerobot_features,
-            self.policy_image_features,
-        )
+        if self.policy_type == "pose_act":
+            observation = self._raw_pose_act_observation_to_observation(observation_t.get_observation())
+        else:
+            observation = raw_observation_to_observation(
+                observation_t.get_observation(),
+                self.lerobot_features,
+                self.policy_image_features,
+            )
         prepare_time = time.perf_counter() - start_prepare
 
         if self._is_pose_act_pose7d_observation(observation):

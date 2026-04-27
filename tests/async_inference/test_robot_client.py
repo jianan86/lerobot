@@ -237,8 +237,10 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
 
 def test_pose_act_piper_client_sends_pose7d_observation(monkeypatch):
     from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.helpers import TimedObservation
     from lerobot.async_inference.robot_client import RobotClient
     from lerobot.robots.mock_piper_follower import MockPiperFollowerConfig
+    from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
     client = RobotClient(
         RobotClientConfig(
@@ -270,10 +272,51 @@ def test_pose_act_piper_client_sends_pose7d_observation(monkeypatch):
         client.stop()
 
     assert sent, "control_loop_observation should send a TimedObservation"
+    assert isinstance(sent[0], TimedObservation)
     observation = sent[0].get_observation()
+    assert tuple(observation[OBS_STATE].shape) == (2, 7)
+    torch.testing.assert_close(observation[OBS_STATE][0], observation[OBS_STATE][1], rtol=0, atol=0)
     for key in ["x", "y", "z", "roll", "pitch", "yaw", "gripper_width"]:
         assert key in observation
         assert key in raw_observation
+    image_keys = [key for key in observation if key.startswith(f"{OBS_IMAGES}.")]
+    assert image_keys
+    for key in image_keys:
+        assert observation[key].shape[0] == 2
+
+
+def test_pose_act_piper_client_sends_previous_and_current_frames(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.robots.mock_piper_follower import MockPiperFollowerConfig
+    from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+
+    client = RobotClient(
+        RobotClientConfig(
+            robot=MockPiperFollowerConfig(verbose=False),
+            server_address="localhost:9999",
+            policy_type="pose_act",
+            pretrained_name_or_path="test",
+            actions_per_chunk=3,
+        )
+    )
+    sent = []
+    monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or True)
+
+    try:
+        client.control_loop_observation(task="test")
+        first_obs = sent[-1].get_observation()
+        first_pose = first_obs[OBS_STATE][1].clone()
+        client.robot._ee_state["x"] += 0.05
+        client.control_loop_observation(task="test")
+        second_obs = sent[-1].get_observation()
+    finally:
+        client.stop()
+
+    torch.testing.assert_close(second_obs[OBS_STATE][0], first_pose, rtol=0, atol=1e-6)
+    assert second_obs[OBS_STATE][1, 0] > second_obs[OBS_STATE][0, 0]
+    image_key = next(key for key in second_obs if key.startswith(f"{OBS_IMAGES}."))
+    assert second_obs[image_key].shape[0] == 2
 
 
 def test_pose_act_piper_client_handles_pose7d_response():
@@ -293,7 +336,7 @@ def test_pose_act_piper_client_handles_pose7d_response():
 
     try:
         action = client._action_tensor_to_action_dict(
-            torch.tensor([0.21, 0.02, 0.31, 0.1, 0.2, 0.3, 0.04], dtype=torch.float32)
+            torch.tensor([0.21, 0.02, 0.31, 0.0, 0.0, 0.0, 0.04], dtype=torch.float32)
         )
     finally:
         client.stop()
@@ -301,10 +344,10 @@ def test_pose_act_piper_client_handles_pose7d_response():
     assert action == {
         "ee.abs_x": pytest.approx(0.21),
         "ee.abs_y": pytest.approx(0.02),
-        "ee.abs_z": pytest.approx(0.31),
-        "ee.abs_rx": pytest.approx(0.1),
-        "ee.abs_ry": pytest.approx(0.2),
-        "ee.abs_rz": pytest.approx(0.3),
+        "ee.abs_z": pytest.approx(0.1157),
+        "ee.abs_rx": pytest.approx(0.0),
+        "ee.abs_ry": pytest.approx(0.0),
+        "ee.abs_rz": pytest.approx(0.0),
         "gripper.pos": pytest.approx(0.04),
     }
 

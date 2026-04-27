@@ -14,6 +14,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 
@@ -107,6 +108,13 @@ class PolicyServerConfig:
             "oscillates the gripper."
         },
     )
+    result_dump_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional directory where each pose_act inference result is dumped as a .pt file "
+            "for offline IsaacLab playback and debugging."
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -121,6 +129,15 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+
+        if self.result_dump_dir is not None and not str(self.result_dump_dir).strip():
+            raise ValueError("result_dump_dir cannot be an empty string")
+
+    @property
+    def result_dump_path(self) -> Path | None:
+        if self.result_dump_dir is None:
+            return None
+        return Path(self.result_dump_dir)
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":

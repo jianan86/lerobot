@@ -270,14 +270,11 @@ def test_predict_pose_act_pose7d_chunk(monkeypatch):
 
     obs = TimedObservation(
         observation={
-            "x": 0.2,
-            "y": 0.0,
-            "z": 0.3,
-            "roll": 0.0,
-            "pitch": 0.0,
-            "yaw": 0.0,
-            "gripper_width": 0.04,
-            "fisheye_rgb": torch.zeros(32, 32, 3, dtype=torch.uint8).numpy(),
+            OBS_STATE: torch.tensor(
+                [[0.2, 0.0, 0.3, 0.0, 0.0, 0.0, 0.04], [0.21, 0.0, 0.31, 0.0, 0.0, 0.0, 0.04]],
+                dtype=torch.float32,
+            ),
+            "observation.images.fisheye_rgb": torch.zeros(2, 32, 32, 3, dtype=torch.uint8).numpy(),
         },
         timestamp=time.time(),
         timestep=7,
@@ -289,7 +286,87 @@ def test_predict_pose_act_pose7d_chunk(monkeypatch):
     assert timed_actions[0].get_action().shape == (7,)
     torch.testing.assert_close(
         timed_actions[0].get_action(),
-        torch.tensor([0.4, 0.0, 0.6, 0.0, -0.0, 0.0, 0.04]),
+        torch.tensor([0.41, 0.0, 0.61, 0.0, -0.0, 0.0, 0.04]),
         rtol=0,
         atol=1e-5,
     )
+
+
+def test_prepare_pose_act_observation_uses_client_history(monkeypatch):
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.pose_act.configuration_pose_act import PoseACTConfig
+
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        input_features={
+            "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+        },
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+    )
+
+    class PoseACTStub:
+        def __init__(self, cfg):
+            self.config = cfg
+
+    server = PolicyServer(PolicyServerConfig(host="localhost", port=9998))
+    server.policy_type = "pose_act"
+    server.policy = PoseACTStub(config)
+
+    observation = server._raw_pose_act_observation_to_observation(
+        {
+            OBS_STATE: torch.tensor(
+                [[0.1, 0.0, 0.2, 0.0, 0.0, 0.0, 0.01], [0.2, 0.1, 0.3, 0.0, 0.0, 0.0, 0.02]],
+                dtype=torch.float32,
+            ),
+            "observation.images.fisheye_rgb": torch.zeros(2, 20, 20, 3, dtype=torch.uint8),
+        }
+    )
+    prepared = server._prepare_pose_act_observation(observation)
+
+    assert tuple(prepared[OBS_STATE].shape) == (1, 2, 10)
+    assert tuple(prepared["observation.images.fisheye_rgb"].shape) == (1, 2, 3, 16, 16)
+
+
+def test_pose_act_result_dump(tmp_path):
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.helpers import TimedAction, TimedObservation
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    server = PolicyServer(
+        PolicyServerConfig(host="localhost", port=9998, result_dump_dir=str(tmp_path))
+    )
+    server.policy_type = "pose_act"
+    server.device = "cpu"
+    server.actions_per_chunk = 2
+
+    observation = TimedObservation(
+        observation={
+            "request_id": "req-0001",
+            OBS_STATE: torch.tensor(
+                [[0.1, 0.0, 0.2, 0.0, 0.0, 0.0, 0.01], [0.2, 0.1, 0.3, 0.0, 0.0, 0.0, 0.02]],
+                dtype=torch.float32,
+            ),
+            "observation.images.fisheye_rgb": torch.zeros(2, 20, 20, 3, dtype=torch.uint8).numpy(),
+        },
+        timestamp=time.time(),
+        timestep=11,
+        must_go=True,
+    )
+    chunk = [
+        TimedAction(timestamp=observation.timestamp, timestep=11, action=torch.zeros(7, dtype=torch.float32)),
+        TimedAction(timestamp=observation.timestamp + 0.1, timestep=12, action=torch.ones(7, dtype=torch.float32)),
+    ]
+
+    dump_path = server._dump_pose_act_result(observation, chunk)
+
+    assert dump_path == tmp_path / "req-0001" / "result.pt"
+    assert dump_path.is_file()
+    payload = torch.load(dump_path, map_location="cpu")
+    assert payload["request_id"] == "req-0001"
+    assert tuple(payload["actions"].shape) == (2, 7)
+    assert tuple(payload["observation_state"].shape) == (2, 7)
+    assert payload["observation_image_key"] == "observation.images.fisheye_rgb"

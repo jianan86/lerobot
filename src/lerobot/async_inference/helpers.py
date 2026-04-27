@@ -74,7 +74,7 @@ def is_image_key(k: str) -> bool:
 def resize_robot_observation_image(image: torch.tensor, resize_dims: tuple[int, int, int]) -> torch.tensor:
     assert image.ndim == 3, f"Image must be (C, H, W)! Received {image.shape}"
     # (H, W, C) -> (C, H, W) for resizing from robot obsevation resolution to policy image resolution
-    image = image.permute(2, 0, 1)
+    image = image.permute(2, 0, 1).to(torch.float32)
     dims = (resize_dims[1], resize_dims[2])
     # Add batch dimension for interpolate: (C, H, W) -> (1, C, H, W)
     image_batched = image.unsqueeze(0)

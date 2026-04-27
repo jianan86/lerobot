@@ -37,6 +37,7 @@ import logging
 import pickle  # nosec
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict
 from pprint import pformat
@@ -65,6 +66,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
 from .adapters import POSE7D_NAMES, PoseActPiperAdapter, is_pose_act_piper
 from .configs import RobotClientConfig
@@ -100,6 +102,7 @@ class RobotClient:
         self._pose_act_adapter: PoseActPiperAdapter | None = None
         if is_pose_act_piper(config.policy_type, config.robot.type):
             self._pose_act_adapter = PoseActPiperAdapter(self.robot)
+        self._pose_act_history: deque[dict[str, Any]] = deque(maxlen=2)
 
         if self._pose_act_adapter is not None:
             lerobot_features = self._pose_act_piper_lerobot_features()
@@ -148,7 +151,7 @@ class RobotClient:
     def _pose_act_piper_lerobot_features(self) -> dict[str, dict]:
         """Feature contract for pose_act: pose7d state plus the robot cameras."""
         features = {
-            "observation.state": {
+            OBS_STATE: {
                 "dtype": "float32",
                 "shape": (len(POSE7D_NAMES),),
                 "names": list(POSE7D_NAMES),
@@ -156,7 +159,7 @@ class RobotClient:
         }
         for key, shape in self.robot.observation_features.items():
             if isinstance(shape, tuple):
-                features[f"observation.images.{key}"] = {
+                features[f"{OBS_IMAGES}.{key}"] = {
                     "dtype": "image",
                     "shape": shape,
                     "names": ["height", "width", "channels"],
@@ -436,18 +439,59 @@ class RobotClient:
         with self.action_queue_lock:
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
+    def _capture_pose_act_observation_frame(self, task: str) -> RawObservation:
+        raw_observation: RawObservation = self.robot.get_observation()
+        pose7d = self._pose_act_adapter.current_pose7d()
+
+        frame: RawObservation = {
+            OBS_STATE: pose7d.clone(),
+            "task": task,
+        }
+        frame.update(
+            {name: float(value) for name, value in zip(POSE7D_NAMES, pose7d.tolist(), strict=True)}
+        )
+
+        for key, shape in self.robot.observation_features.items():
+            if isinstance(shape, tuple) and key in raw_observation:
+                frame[f"{OBS_IMAGES}.{key}"] = raw_observation[key]
+
+        return frame
+
+    def _build_pose_act_history_observation(self, task: str) -> RawObservation:
+        frame = self._capture_pose_act_observation_frame(task)
+        self._pose_act_history.append(frame)
+        if len(self._pose_act_history) == 1:
+            self._pose_act_history.append(frame)
+
+        history = list(self._pose_act_history)
+        observation: RawObservation = {
+            OBS_STATE: torch.stack(
+                [torch.as_tensor(history_frame[OBS_STATE], dtype=torch.float32) for history_frame in history], dim=0
+            ),
+            "task": task,
+        }
+        observation.update(
+            {name: history[-1][name] for name in POSE7D_NAMES}
+        )
+
+        for key in self.policy_config.lerobot_features:
+            if key.startswith(f"{OBS_IMAGES}."):
+                observation[key] = torch.stack(
+                    [torch.as_tensor(history_frame[key]) for history_frame in history], dim=0
+                )
+
+        return observation
+
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
-            raw_observation: RawObservation = self.robot.get_observation()
             if self._pose_act_adapter is not None:
-                pose7d = self._pose_act_adapter.current_pose7d()
-                raw_observation.update(
-                    {name: float(value) for name, value in zip(POSE7D_NAMES, pose7d.tolist(), strict=True)}
-                )
-            raw_observation["task"] = task
+                raw_observation = self._build_pose_act_history_observation(task)
+            else:
+                raw_observation = self.robot.get_observation()
+                raw_observation["task"] = task
 
             with self.latest_action_lock:
                 latest_action = self.latest_action

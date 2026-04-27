@@ -8,6 +8,17 @@ supports both.
 For shell pose10d, degenerate relative rotations (all-zero rot6d) are
 substituted with the identity 6D vector ``[1, 0, 0, 0, 1, 0]`` so that the zero
 action means "stay at current pose".
+
+The fixed TCP extrinsics are encoded as a single homogeneous transform
+``T_EE_TCP`` whose physical meaning is:
+
+- ``p_ee = T_EE_TCP @ p_tcp``
+- ``T_base_tcp = T_base_ee @ T_EE_TCP``
+
+The transform captures both:
+
+- translation: TCP origin is ``0.1943 m`` along ``+z`` of the EE frame
+- rotation: ``tcp.x = ee.z``, ``tcp.y = ee.y``, ``tcp.z = -ee.x``
 """
 
 from __future__ import annotations
@@ -19,7 +30,10 @@ import torch
 from torch import Tensor
 
 from lerobot.utils.pose_act import (
+    POSE7D_NAMES,
     absolute_pose10d,
+    euler_rpy_to_matrix,
+    matrix_to_euler_rpy,
     pose10d_to_pose7d,
     pose7d_to_pose10d,
 )
@@ -27,6 +41,38 @@ from lerobot.utils.pose_act import (
 logger = logging.getLogger(__name__)
 
 _IDENTITY_ROT6D = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+R_EE_TCP = torch.tensor(
+    [
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+    ],
+    dtype=torch.float32,
+)
+t_EE_TCP = torch.tensor([0.0, 0.0, 0.1943], dtype=torch.float32)
+T_EE_TCP = torch.eye(4, dtype=torch.float32)
+T_EE_TCP[:3, :3] = R_EE_TCP
+T_EE_TCP[:3, 3] = t_EE_TCP
+T_TCP_EE = torch.linalg.inv(T_EE_TCP)
+
+
+def _pose7d_to_transform(pose7d: Tensor) -> Tensor:
+    if pose7d.shape != (7,):
+        raise ValueError(f"Expected pose7d shape (7,), got {tuple(pose7d.shape)}")
+    transform = torch.eye(4, dtype=torch.float32)
+    transform[:3, :3] = euler_rpy_to_matrix(pose7d[3:6])
+    transform[:3, 3] = pose7d[:3]
+    return transform
+
+
+def _transform_to_pose7d(transform: Tensor, gripper: float) -> Tensor:
+    if transform.shape != (4, 4):
+        raise ValueError(f"Expected homogeneous transform shape (4, 4), got {tuple(transform.shape)}")
+    pose7d = torch.empty(7, dtype=torch.float32)
+    pose7d[:3] = transform[:3, 3]
+    pose7d[3:6] = matrix_to_euler_rpy(transform[:3, :3])
+    pose7d[6] = gripper
+    return pose7d
 
 
 def is_pose_act_piper(policy_type: str, robot_type: str) -> bool:
@@ -41,8 +87,20 @@ class PoseActPiperAdapter:
         self.robot = robot
         self._last_log_t = 0.0
 
+    def ee_pose7d_to_tcp_pose7d(self, ee_pose7d: Tensor) -> Tensor:
+        pose = ee_pose7d.detach().to(torch.float32).cpu()
+        base_to_ee = _pose7d_to_transform(pose)
+        base_to_tcp = base_to_ee @ T_EE_TCP
+        return _transform_to_pose7d(base_to_tcp, float(pose[6].item()))
+
+    def tcp_pose7d_to_ee_pose7d(self, tcp_pose7d: Tensor) -> Tensor:
+        pose = tcp_pose7d.detach().to(torch.float32).cpu()
+        base_to_tcp = _pose7d_to_transform(pose)
+        base_to_ee = base_to_tcp @ T_TCP_EE
+        return _transform_to_pose7d(base_to_ee, float(pose[6].item()))
+
     def current_pose7d(self) -> Tensor:
-        """Read Piper TCP and gripper as base-frame pose7d."""
+        """Read Piper EE pose and convert it to base-frame TCP pose7d."""
         get_end_pose = getattr(self.robot, "_get_end_pose", None)
         if get_end_pose is None:
             raise RuntimeError(
@@ -55,7 +113,7 @@ class PoseActPiperAdapter:
         if get_motor_positions is not None:
             motors = get_motor_positions()
             gripper = float(motors.get("gripper.pos", 0.0))
-        return torch.tensor(
+        ee_pose7d = torch.tensor(
             [
                 float(pose["x"]),
                 float(pose["y"]),
@@ -67,6 +125,7 @@ class PoseActPiperAdapter:
             ],
             dtype=torch.float32,
         )
+        return self.ee_pose7d_to_tcp_pose7d(ee_pose7d)
 
     def _current_base_pose10d(self) -> Tensor:
         return pose7d_to_pose10d(self.current_pose7d())
@@ -83,13 +142,14 @@ class PoseActPiperAdapter:
         }
 
     def convert(self, action_tensor: Tensor) -> dict[str, float]:
-        """Convert a single pose_act action into an ``ee.abs_*`` dict."""
+        """Convert a single pose_act TCP action into an ``ee.abs_*`` dict."""
         if action_tensor.ndim != 1 or action_tensor.shape[0] not in (7, 10):
             raise ValueError(
                 f"PoseActPiperAdapter expects a (7,) pose7d or (10,) pose10d tensor, got {tuple(action_tensor.shape)}"
             )
         if action_tensor.shape[0] == 7:
-            return self._pose7d_to_action_dict(action_tensor.detach().to(torch.float32).cpu())
+            tcp_pose7d = action_tensor.detach().to(torch.float32).cpu()
+            return self._pose7d_to_action_dict(self.tcp_pose7d_to_ee_pose7d(tcp_pose7d))
 
         rel = action_tensor.detach().to(torch.float32).cpu().clone()
         rot6d = rel[3:9]
@@ -104,4 +164,5 @@ class PoseActPiperAdapter:
 
         base = self._current_base_pose10d()
         absolute = absolute_pose10d(rel, base)
-        return self._pose7d_to_action_dict(pose10d_to_pose7d(absolute))
+        tcp_pose7d = pose10d_to_pose7d(absolute)
+        return self._pose7d_to_action_dict(self.tcp_pose7d_to_ee_pose7d(tcp_pose7d))

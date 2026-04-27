@@ -53,6 +53,7 @@ def _as_pose10d_feature(feature: PolicyFeature) -> PolicyFeature:
     return PolicyFeature(type=feature.type, shape=(10,))
 
 
+@ProcessorStepRegistry.register("pose_act_relative_action")
 @ProcessorStepRegistry.register("pose_act_relative_pose")
 @dataclass
 class RelativePoseProcessorStep(ProcessorStep):
