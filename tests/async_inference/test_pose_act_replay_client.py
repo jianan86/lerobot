@@ -10,15 +10,15 @@ pytest.importorskip("grpc")
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.async_inference.helpers import TimedAction
-from lerobot.async_inference.pose_act_viz import (
+from lerobot.async_inference.pose_act_replay_client import (
     FifoChunkBuffer,
     LeRobotReplaySource,
     LatestChunkBuffer,
     LoadedObservation,
-    PoseActVizClient,
+    PoseActReplayClient,
     SocketActionChunkConsumer,
-    _to_image_hwc_uint8,
     _save_observation_images,
+    _to_image_hwc_uint8,
 )
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
@@ -40,7 +40,7 @@ def test_lerobot_replay_source_builds_raw_observation(monkeypatch):
         "task": "stack the cube",
     }
     monkeypatch.setattr(
-        "lerobot.async_inference.pose_act_viz.LeRobotDataset",
+        "lerobot.async_inference.pose_act_replay_client.LeRobotDataset",
         lambda *args, **kwargs: _FakeDataset(frame),
     )
 
@@ -71,7 +71,7 @@ def test_lerobot_replay_source_builds_history(monkeypatch):
             return frames[idx]
 
     monkeypatch.setattr(
-        "lerobot.async_inference.pose_act_viz.LeRobotDataset",
+        "lerobot.async_inference.pose_act_replay_client.LeRobotDataset",
         lambda *args, **kwargs: _FakeHistoryDataset(),
     )
 
@@ -90,7 +90,7 @@ def test_lerobot_replay_source_rejects_missing_camera(monkeypatch):
         OBS_STATE: torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7], dtype=torch.float32),
     }
     monkeypatch.setattr(
-        "lerobot.async_inference.pose_act_viz.LeRobotDataset",
+        "lerobot.async_inference.pose_act_replay_client.LeRobotDataset",
         lambda *args, **kwargs: _FakeDataset(frame),
     )
 
@@ -126,7 +126,7 @@ def test_socket_consumer_serializes_chunk(monkeypatch):
             payloads.append(data)
 
     monkeypatch.setattr(
-        "lerobot.async_inference.pose_act_viz.socket.create_connection",
+        "lerobot.async_inference.pose_act_replay_client.socket.create_connection",
         lambda *args, **kwargs: _FakeSocket(),
     )
 
@@ -196,11 +196,19 @@ def test_to_image_hwc_uint8_scales_unit_float_images():
     assert int(converted[1, 0, 0]) == 255
 
 
-def test_pose_act_viz_client_forwards_chunk_to_consumer(monkeypatch):
+def test_pose_act_replay_client_forwards_chunk_to_consumer(monkeypatch):
     class _FakeSource:
         lerobot_features = {
-            OBS_STATE: {"dtype": "float32", "shape": (7,), "names": ["x", "y", "z", "roll", "pitch", "yaw", "gripper_width"]},
-            f"{OBS_IMAGES}.fisheye_rgb": {"dtype": "image", "shape": (8, 8, 3), "names": ["height", "width", "channels"]},
+            OBS_STATE: {
+                "dtype": "float32",
+                "shape": (7,),
+                "names": ["x", "y", "z", "roll", "pitch", "yaw", "gripper_width"],
+            },
+            f"{OBS_IMAGES}.fisheye_rgb": {
+                "dtype": "image",
+                "shape": (8, 8, 3),
+                "names": ["height", "width", "channels"],
+            },
         }
 
         def load_history(
@@ -219,11 +227,11 @@ def test_pose_act_viz_client_forwards_chunk_to_consumer(monkeypatch):
             )
 
     monkeypatch.setattr(
-        "lerobot.async_inference.pose_act_viz.PreTrainedConfig.from_pretrained",
+        "lerobot.async_inference.pose_act_replay_client.PreTrainedConfig.from_pretrained",
         lambda path: type("Cfg", (), {"n_obs_steps": 2})(),
     )
     forwarded = []
-    client = PoseActVizClient(
+    client = PoseActReplayClient(
         source=_FakeSource(),
         server_address="127.0.0.1:8080",
         pretrained_name_or_path="dummy-checkpoint",
@@ -233,6 +241,7 @@ def test_pose_act_viz_client_forwards_chunk_to_consumer(monkeypatch):
         TimedAction(timestamp=1.0, timestep=3, action=torch.linspace(0, 1, 7)),
         TimedAction(timestamp=1.1, timestep=4, action=torch.linspace(1, 2, 7)),
     ]
+
     @contextmanager
     def _fake_session():
         yield object()
@@ -252,12 +261,24 @@ def test_pose_act_viz_client_forwards_chunk_to_consumer(monkeypatch):
     assert isinstance(forwarded_metadata["request_id"], str)
 
 
-def test_pose_act_viz_client_replay_range_requests_frames_in_order(monkeypatch):
+def test_pose_act_replay_client_replay_range_requests_frames_in_order(monkeypatch):
     class _FakeSource:
         lerobot_features = {
-            OBS_STATE: {"dtype": "float32", "shape": (7,), "names": ["x", "y", "z", "roll", "pitch", "yaw", "gripper_width"]},
-            f"{OBS_IMAGES}.fisheye_rgb": {"dtype": "image", "shape": (8, 8, 3), "names": ["height", "width", "channels"]},
+            OBS_STATE: {
+                "dtype": "float32",
+                "shape": (7,),
+                "names": ["x", "y", "z", "roll", "pitch", "yaw", "gripper_width"],
+            },
+            f"{OBS_IMAGES}.fisheye_rgb": {
+                "dtype": "image",
+                "shape": (8, 8, 3),
+                "names": ["height", "width", "channels"],
+            },
         }
+
+        def get_num_frames(self, episode_idx: int) -> int:
+            assert episode_idx == 1
+            return 4
 
         def load_history(
             self, episode_idx: int, frame_idx: int, n_obs_steps: int, task: str | None = None
@@ -274,28 +295,32 @@ def test_pose_act_viz_client_replay_range_requests_frames_in_order(monkeypatch):
             )
 
     monkeypatch.setattr(
-        "lerobot.async_inference.pose_act_viz.PreTrainedConfig.from_pretrained",
+        "lerobot.async_inference.pose_act_replay_client.PreTrainedConfig.from_pretrained",
         lambda path: type("Cfg", (), {"n_obs_steps": 2})(),
     )
-    client = PoseActVizClient(
+    client = PoseActReplayClient(
         source=_FakeSource(),
-        server_address="127.0.0.1:8081",
+        server_address="127.0.0.1:8080",
         pretrained_name_or_path="dummy-checkpoint",
     )
-    requested_timesteps = []
+    requested_frames = []
 
     @contextmanager
     def _fake_session():
         yield object()
 
-    def _fake_request_actions(stub, timed_observation):
-        requested_timesteps.append(timed_observation.timestep)
-        return [TimedAction(timestamp=1.0, timestep=timed_observation.timestep, action=torch.zeros(7))]
-
     monkeypatch.setattr(client, "_session", _fake_session)
-    monkeypatch.setattr(client, "_request_actions", _fake_request_actions)
+    monkeypatch.setattr(
+        client,
+        "_run_loaded_frame",
+        lambda stub, episode_idx, frame_idx, task, preview_image, server_result_dir: requested_frames.append(
+            (episode_idx, frame_idx, task)
+        )
+        or [TimedAction(timestamp=0.0, timestep=frame_idx, action=torch.zeros(7))],
+    )
 
-    actions = client.replay_range(episode_idx=1, frame_start=3, frame_end=5)
+    all_actions = client.replay_range(episode_idx=1, frame_start=1, frame_end=3, task="demo")
 
-    assert len(actions) == 3
-    assert requested_timesteps == [3, 4, 5]
+    assert requested_frames == [(1, 1, "demo"), (1, 2, "demo"), (1, 3, "demo")]
+    assert len(all_actions) == 3
+

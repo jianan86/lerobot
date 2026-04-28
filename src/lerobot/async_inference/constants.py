@@ -32,5 +32,4 @@ SUPPORTED_ROBOTS = [
     "bi_so_follower",
     "omx_follower",
     "piper_follower",
-    "mock_piper_follower",
 ]

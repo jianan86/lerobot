@@ -22,11 +22,22 @@ pytest.importorskip("serial", reason="pyserial is required (install lerobot[hard
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 
+class _StubPoseActPiperRobot:
+    def __init__(self):
+        self._ee_state = {"x": 0.2, "y": 0.0, "z": 0.3, "rx": 0.0, "ry": 0.0, "rz": 0.0}
+        self._joint_state = {"gripper.pos": 0.0}
+
+    def _get_end_pose(self) -> dict[str, float]:
+        return {k: float(v) for k, v in self._ee_state.items()}
+
+    def _get_motor_positions(self) -> dict[str, float]:
+        return {k: float(v) for k, v in self._joint_state.items()}
+
+
 def _make_adapter():
     from lerobot.async_inference.adapters import PoseActPiperAdapter
-    from lerobot.robots.mock_piper_follower import MockPiperFollower, MockPiperFollowerConfig
 
-    return PoseActPiperAdapter(MockPiperFollower(MockPiperFollowerConfig(verbose=False)))
+    return PoseActPiperAdapter(_StubPoseActPiperRobot())
 
 
 def test_pose_act_piper_round_trip_ee_tcp():

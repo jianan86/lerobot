@@ -77,7 +77,7 @@ def _transform_to_pose7d(transform: Tensor, gripper: float) -> Tensor:
 
 def is_pose_act_piper(policy_type: str, robot_type: str) -> bool:
     """Adapter is used when the policy is pose_act and the robot is any Piper-like follower."""
-    return policy_type == "pose_act" and robot_type in ("piper_follower", "mock_piper_follower")
+    return policy_type == "pose_act" and robot_type == "piper_follower"
 
 
 class PoseActPiperAdapter:

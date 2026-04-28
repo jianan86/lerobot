@@ -329,7 +329,7 @@ class LeRobotReplaySource:
         return self.load_frame(episode_idx, frame_idx).raw_observation
 
 
-class PoseActVizClient:
+class PoseActReplayClient:
     def __init__(
         self,
         source: LeRobotReplaySource,
@@ -345,7 +345,7 @@ class PoseActVizClient:
         self.policy_device = policy_device
         self.actions_per_chunk = actions_per_chunk
         self.consumer = consumer
-        self.logger = get_logger("pose_act_viz_client")
+        self.logger = get_logger("pose_act_replay_client")
         self._policy_config = PreTrainedConfig.from_pretrained(pretrained_name_or_path)
         if not hasattr(self._policy_config, "n_obs_steps"):
             raise ValueError(
@@ -495,7 +495,12 @@ class PoseActVizClient:
         try:
             payload = pickle.dumps(timed_observation)
             stub.SendObservations(
-                send_bytes_in_chunks(payload, services_pb2.Observation, log_prefix="[POSE_ACT_VIZ]", silent=True)
+                send_bytes_in_chunks(
+                    payload,
+                    services_pb2.Observation,
+                    log_prefix="[POSE_ACT_REPLAY_CLIENT]",
+                    silent=True,
+                )
             )
             response = stub.GetActions(services_pb2.Empty())
         except grpc.RpcError as exc:
@@ -626,7 +631,7 @@ def main() -> None:
         root=args.dataset_root,
         camera_key=args.camera_key,
     )
-    client = PoseActVizClient(
+    client = PoseActReplayClient(
         source=source,
         server_address=args.server_address,
         pretrained_name_or_path=args.pretrained_name_or_path,

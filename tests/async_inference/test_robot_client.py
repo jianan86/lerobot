@@ -22,6 +22,7 @@ from __future__ import annotations
 import time
 from queue import Queue
 
+import numpy as np
 import pytest
 import torch
 
@@ -84,6 +85,68 @@ def _make_actions(start_ts: float, start_t: int, count: int):
         action_tensor = torch.full((6,), timestep, dtype=torch.float32)
         actions.append(TimedAction(action=action_tensor, timestep=timestep, timestamp=timestamp))
     return actions
+
+
+class _StubPoseActPiperRobot:
+    def __init__(self, fps: int = 30):
+        self.fps = fps
+        self._connected = False
+        self._rng = np.random.default_rng(0)
+        self._joint_state = {
+            "joint_1.pos": 0.0,
+            "joint_2.pos": 0.0,
+            "joint_3.pos": 0.0,
+            "joint_4.pos": 0.0,
+            "joint_5.pos": 0.0,
+            "joint_6.pos": 0.0,
+            "gripper.pos": 0.0,
+        }
+        self._ee_state = {"x": 0.2, "y": 0.0, "z": 0.3, "rx": 0.0, "ry": 0.0, "rz": 0.0}
+        self.observation_features = {"front": (480, 640, 3)}
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def connect(self, calibrate: bool = True) -> None:
+        del calibrate
+        self._connected = True
+
+    def disconnect(self) -> None:
+        self._connected = False
+
+    def _get_end_pose(self) -> dict[str, float]:
+        return {k: float(v) for k, v in self._ee_state.items()}
+
+    def _get_motor_positions(self) -> dict[str, float]:
+        return {k: float(v) for k, v in self._joint_state.items()}
+
+    def get_observation(self) -> dict[str, object]:
+        assert self._connected
+        obs = {k: float(v) for k, v in self._joint_state.items()}
+        obs["front"] = self._rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
+        return obs
+
+
+def _make_pose_act_piper_client(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.robots.piper_follower import PiperFollowerConfig
+
+    monkeypatch.setattr(
+        "lerobot.async_inference.robot_client.make_robot_from_config",
+        lambda config: _StubPoseActPiperRobot(),
+    )
+
+    return RobotClient(
+        RobotClientConfig(
+            robot=PiperFollowerConfig(enable_on_connect=False, disable_on_disconnect=False),
+            server_address="localhost:9999",
+            policy_type="pose_act",
+            pretrained_name_or_path="test",
+            actions_per_chunk=3,
+        )
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -236,21 +299,10 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
 
 
 def test_pose_act_piper_client_sends_pose7d_observation(monkeypatch):
-    from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.async_inference.helpers import TimedObservation
-    from lerobot.async_inference.robot_client import RobotClient
-    from lerobot.robots.mock_piper_follower import MockPiperFollowerConfig
     from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
-    client = RobotClient(
-        RobotClientConfig(
-            robot=MockPiperFollowerConfig(verbose=False),
-            server_address="localhost:9999",
-            policy_type="pose_act",
-            pretrained_name_or_path="test",
-            actions_per_chunk=3,
-        )
-    )
+    client = _make_pose_act_piper_client(monkeypatch)
     sent = []
     monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or True)
 
@@ -286,20 +338,9 @@ def test_pose_act_piper_client_sends_pose7d_observation(monkeypatch):
 
 
 def test_pose_act_piper_client_sends_previous_and_current_frames(monkeypatch):
-    from lerobot.async_inference.configs import RobotClientConfig
-    from lerobot.async_inference.robot_client import RobotClient
-    from lerobot.robots.mock_piper_follower import MockPiperFollowerConfig
     from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
-    client = RobotClient(
-        RobotClientConfig(
-            robot=MockPiperFollowerConfig(verbose=False),
-            server_address="localhost:9999",
-            policy_type="pose_act",
-            pretrained_name_or_path="test",
-            actions_per_chunk=3,
-        )
-    )
+    client = _make_pose_act_piper_client(monkeypatch)
     sent = []
     monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or True)
 
@@ -319,20 +360,8 @@ def test_pose_act_piper_client_sends_previous_and_current_frames(monkeypatch):
     assert second_obs[image_key].shape[0] == 2
 
 
-def test_pose_act_piper_client_handles_pose7d_response():
-    from lerobot.async_inference.configs import RobotClientConfig
-    from lerobot.async_inference.robot_client import RobotClient
-    from lerobot.robots.mock_piper_follower import MockPiperFollowerConfig
-
-    client = RobotClient(
-        RobotClientConfig(
-            robot=MockPiperFollowerConfig(verbose=False),
-            server_address="localhost:9999",
-            policy_type="pose_act",
-            pretrained_name_or_path="test",
-            actions_per_chunk=3,
-        )
-    )
+def test_pose_act_piper_client_handles_pose7d_response(monkeypatch):
+    client = _make_pose_act_piper_client(monkeypatch)
 
     try:
         action = client._action_tensor_to_action_dict(

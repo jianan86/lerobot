@@ -59,7 +59,7 @@ from lerobot.robots import (  # noqa: F401
     omx_follower,
     so_follower,
 )
-from lerobot.robots import mock_piper_follower, piper_follower  # noqa: F401
+from lerobot.robots import piper_follower  # noqa: F401
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
