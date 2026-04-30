@@ -115,6 +115,14 @@ class PolicyServerConfig:
             "for offline IsaacLab playback and debugging."
         },
     )
+    pose_act_visualize_observation: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, open an OpenCV window on the server to visualize the latest pose_act "
+            "two-frame image history as [t-1 | t0]. Visualization runs asynchronously and never "
+            "blocks inference."
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""

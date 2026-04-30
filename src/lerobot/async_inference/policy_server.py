@@ -27,6 +27,9 @@ python -m lerobot.async_inference.policy_server \
 import logging
 import math
 import pickle  # nosec
+import struct
+import subprocess
+import sys
 import threading
 import time
 from concurrent import futures
@@ -38,6 +41,7 @@ from typing import Any
 
 import draccus
 import grpc
+import numpy as np
 import torch
 
 from lerobot.policies import get_policy_class, make_pre_post_processors
@@ -70,6 +74,7 @@ from .helpers import (
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     prefix = "policy_server"
     logger = get_logger(prefix)
+    _POSE_ACT_VIS_WINDOW = "pose_act_observation"
 
     def __init__(self, config: PolicyServerConfig):
         self.config = config
@@ -85,6 +90,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self._predicted_timesteps_lock = threading.Lock()
         self._predicted_timesteps = set()
+        self._pose_act_vis_lock = threading.Lock()
+        self._pose_act_vis_frame_queue: Queue[np.ndarray | None] = Queue(maxsize=1)
+        self._pose_act_vis_process: subprocess.Popen[bytes] | None = None
+        self._pose_act_vis_enabled = bool(config.pose_act_visualize_observation)
+        self._pose_act_vis_warned = False
+        self._pose_act_vis_warned_no_image_history = False
 
         self.last_processed_obs = None
 
@@ -100,6 +111,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+
+        if self._pose_act_vis_enabled:
+            self._start_pose_act_visualizer()
 
     @property
     def running(self):
@@ -120,6 +134,167 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self._shell_step_count = 0
         self._shell_t0 = None
+
+    def _start_pose_act_visualizer(self) -> None:
+        if self._pose_act_vis_process is not None:
+            return
+        try:
+            self._pose_act_vis_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "lerobot.async_inference.pose_act_visualizer_stream",
+                    self._POSE_ACT_VIS_WINDOW,
+                ],
+                stdin=subprocess.PIPE,
+            )
+            sender_thread = threading.Thread(
+                target=self._pose_act_visualizer_sender_main,
+                name="pose-act-visualizer-sender",
+                daemon=True,
+            )
+            sender_thread.start()
+        except Exception as e:
+            self._pose_act_vis_process = None
+            self._disable_pose_act_visualization(f"failed to start visualization process: {e}")
+
+    def _pose_act_visualizer_sender_main(self) -> None:
+        while self.running and self._pose_act_vis_process is not None:
+            try:
+                frame = self._pose_act_vis_frame_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            if frame is None:
+                break
+            process = self._pose_act_vis_process
+            if process.stdin is None:
+                self._disable_pose_act_visualization("visualization process stdin is unavailable")
+                return
+            try:
+                payload = pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL)  # nosec
+                process.stdin.write(struct.pack("!I", len(payload)))
+                process.stdin.write(payload)
+                process.stdin.flush()
+            except Exception as e:
+                self._disable_pose_act_visualization(f"failed to send frame to visualization process: {e}")
+                return
+
+    def _disable_pose_act_visualization(self, reason: str) -> None:
+        if not self._pose_act_vis_warned:
+            self.logger.warning(f"Disabling pose_act observation visualization: {reason}")
+            self._pose_act_vis_warned = True
+        self._pose_act_vis_enabled = False
+
+    def _publish_pose_act_visualization(self, timed_observation: TimedObservation) -> None:
+        if not self._pose_act_vis_enabled:
+            return
+        if self._pose_act_vis_process is not None and self._pose_act_vis_process.poll() is not None:
+            self._disable_pose_act_visualization(
+                "visualization process exited unexpectedly "
+                f"(exitcode={self._pose_act_vis_process.returncode})"
+            )
+            return
+        try:
+            frame = self._build_pose_act_visualization_frame(timed_observation.get_observation())
+        except Exception as e:
+            self._disable_pose_act_visualization(f"failed to prepare frame: {e}")
+            return
+        if frame is None:
+            if not self._pose_act_vis_warned_no_image_history:
+                image_keys = [key for key in timed_observation.get_observation() if key.startswith("observation.images.")]
+                self.logger.warning(
+                    "PoseACT visualization skipped: no two-frame image history found in observation. "
+                    f"image_keys={image_keys}"
+                )
+                self._pose_act_vis_warned_no_image_history = True
+            return
+        self._enqueue_pose_act_visualization_frame(frame)
+
+    def _enqueue_pose_act_visualization_frame(self, frame: np.ndarray) -> None:
+        try:
+            with self._pose_act_vis_lock:
+                if self._pose_act_vis_frame_queue.full():
+                    try:
+                        _ = self._pose_act_vis_frame_queue.get_nowait()
+                    except Empty:
+                        pass
+                self._pose_act_vis_frame_queue.put_nowait(frame)
+        except Exception as e:
+            self._disable_pose_act_visualization(f"failed to enqueue visualization frame: {e}")
+
+    def _build_pose_act_visualization_frame(self, raw_observation: dict[str, Any]) -> np.ndarray | None:
+        image_history = None
+        image_key = None
+        for key, value in raw_observation.items():
+            if key == OBS_STATE:
+                continue
+            if not key.startswith("observation.images."):
+                continue
+            array = np.asarray(value)
+            if array.ndim == 4 and array.shape[0] >= 2:
+                image_history = array
+                image_key = key
+                break
+
+        if image_history is None:
+            return None
+
+        frames = [
+            self._to_bgr_visualization_frame(image_history[0]),
+            self._to_bgr_visualization_frame(image_history[1]),
+        ]
+        height = max(frame.shape[0] for frame in frames)
+        padded = [self._pad_visualization_frame(frame, height) for frame in frames]
+        canvas = np.concatenate(padded, axis=1)
+
+        import cv2
+
+        labels = ("t-1", "t0")
+        x_offset = 0
+        for label, frame in zip(labels, padded, strict=True):
+            cv2.putText(
+                canvas,
+                label,
+                (x_offset + 12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            x_offset += frame.shape[1]
+
+        if image_key is not None:
+            cv2.putText(
+                canvas,
+                image_key,
+                (12, max(48, height - 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        return canvas
+
+    def _to_bgr_visualization_frame(self, frame: Any) -> np.ndarray:
+        image = np.asarray(frame)
+        if image.ndim != 3:
+            raise ValueError(f"expected image ndim=3, got shape {tuple(image.shape)}")
+        if image.shape[-1] == 1:
+            image = np.repeat(image, 3, axis=2)
+        elif image.shape[-1] != 3:
+            raise ValueError(f"expected image channels=1 or 3, got shape {tuple(image.shape)}")
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(image[..., ::-1])
+
+    def _pad_visualization_frame(self, frame: np.ndarray, target_height: int) -> np.ndarray:
+        if frame.shape[0] == target_height:
+            return frame
+        pad = target_height - frame.shape[0]
+        return np.pad(frame, ((0, pad), (0, 0), (0, 0)), mode="constant", constant_values=0)
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -228,6 +403,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         deserialize_time = time.perf_counter() - start_deserialize
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
+        if self.policy_type == "pose_act":
+            self._publish_pose_act_visualization(timed_observation)
 
         obs_timestep = timed_observation.get_timestep()
         obs_timestamp = timed_observation.get_timestamp()
@@ -788,6 +965,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
     def stop(self):
         """Stop the server"""
+        try:
+            if self._pose_act_vis_frame_queue.full():
+                try:
+                    _ = self._pose_act_vis_frame_queue.get_nowait()
+                except Empty:
+                    pass
+            self._pose_act_vis_frame_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._pose_act_vis_process is not None:
+            try:
+                if self._pose_act_vis_process.stdin is not None:
+                    self._pose_act_vis_process.stdin.close()
+            except Exception:
+                pass
+            self._pose_act_vis_process.wait(timeout=1.0)
+            if self._pose_act_vis_process.poll() is None:
+                self._pose_act_vis_process.terminate()
         self._reset_server()
         self.logger.info("Server stopping...")
 
@@ -812,7 +1007,10 @@ def serve(cfg: PolicyServerConfig):
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
 
-    server.wait_for_termination()
+    try:
+        server.wait_for_termination()
+    finally:
+        policy_server.stop()
 
     policy_server.logger.info("Server terminated")
 

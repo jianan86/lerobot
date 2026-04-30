@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 import torch
 
@@ -370,3 +371,22 @@ def test_pose_act_result_dump(tmp_path):
     assert tuple(payload["actions"].shape) == (2, 7)
     assert tuple(payload["observation_state"].shape) == (2, 7)
     assert payload["observation_image_key"] == "observation.images.fisheye_rgb"
+
+
+def test_pose_act_visualization_publish_overwrites_latest_frame():
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    server = PolicyServer(
+        PolicyServerConfig(host="localhost", port=9998, pose_act_visualize_observation=False)
+    )
+    server._pose_act_vis_enabled = True
+
+    frame_a = np.zeros((8, 20, 3), dtype=np.uint8)
+    frame_b = np.full((8, 20, 3), 255, dtype=np.uint8)
+
+    server._enqueue_pose_act_visualization_frame(frame_a)
+    server._enqueue_pose_act_visualization_frame(frame_b)
+
+    queued = server._pose_act_vis_frame_queue.get_nowait()
+    assert np.array_equal(queued, frame_b)
