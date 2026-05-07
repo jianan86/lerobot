@@ -70,6 +70,7 @@ from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
 from .adapters import POSE7D_NAMES, PoseActPiperAdapter, is_pose_act_piper
 from .configs import RobotClientConfig
+from .jitter_dump import JitterDumpWriter
 from .helpers import (
     Action,
     FPSTracker,
@@ -137,6 +138,8 @@ class RobotClient:
         self.action_queue = Queue()
         self.action_queue_lock = threading.Lock()  # Protect queue operations
         self.action_queue_size = []
+
+        self._jitter_dump = JitterDumpWriter(config.jitter_dump_dir)
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
 
         # FPS measurement
@@ -268,6 +271,10 @@ class RobotClient:
 
         current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
 
+        incoming_first_step = incoming_actions[0].get_timestep() if incoming_actions else -1
+        incoming_last_step = incoming_actions[-1].get_timestep() if incoming_actions else -1
+        fn_name = self.config.aggregate_fn_name
+
         for new_action in incoming_actions:
             with self.latest_action_lock:
                 latest_action = self.latest_action
@@ -283,15 +290,32 @@ class RobotClient:
 
             # If the new action's timestep is in the current action queue, aggregate it
             # TODO: There is probably a way to do this with broadcasting of the two action tensors
+            old_action = current_action_queue[new_action.get_timestep()]
+            new_tensor = new_action.get_action()
+            agg_tensor = aggregate_fn(old_action, new_tensor)
             future_action_queue.put(
                 TimedAction(
                     timestamp=new_action.get_timestamp(),
                     timestep=new_action.get_timestep(),
-                    action=aggregate_fn(
-                        current_action_queue[new_action.get_timestep()], new_action.get_action()
-                    ),
+                    action=agg_tensor,
                 )
             )
+            if self._jitter_dump.enabled:
+                try:
+                    old_seq = old_action.detach().cpu().flatten().tolist()
+                    new_seq = new_tensor.detach().cpu().flatten().tolist()
+                    agg_seq = agg_tensor.detach().cpu().flatten().tolist()
+                except Exception:
+                    continue
+                self._jitter_dump.write_aggregate_event(
+                    timestep=int(new_action.get_timestep()),
+                    old=old_seq[:7],
+                    new=new_seq[:7],
+                    agg=agg_seq[:7],
+                    fn_name=fn_name,
+                    incoming_first_step=int(incoming_first_step),
+                    incoming_last_step=int(incoming_last_step),
+                )
 
         with self.action_queue_lock:
             self.action_queue = future_action_queue
@@ -412,11 +436,40 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        _performed_action = self.robot.send_action(action_dict)
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+
+        if self._jitter_dump.enabled:
+            try:
+                pre_pose7d = timed_action.get_action().detach().cpu().flatten().tolist()
+            except Exception:
+                pre_pose7d = None
+            else:
+                pre_pose7d = pre_pose7d[:7] if len(pre_pose7d) >= 7 else None
+
+            post_pose7d: list[float] | None = None
+            try:
+                if {"ee.abs_x", "ee.abs_y", "ee.abs_z"}.issubset(action_dict):
+                    post_pose7d = [
+                        float(action_dict.get("ee.abs_x", 0.0)),
+                        float(action_dict.get("ee.abs_y", 0.0)),
+                        float(action_dict.get("ee.abs_z", 0.0)),
+                        float(action_dict.get("ee.abs_rx", 0.0)),
+                        float(action_dict.get("ee.abs_ry", 0.0)),
+                        float(action_dict.get("ee.abs_rz", 0.0)),
+                        float(action_dict.get("gripper.pos", 0.0)),
+                    ]
+            except Exception:
+                post_pose7d = None
+
+            self._jitter_dump.write_executed(
+                timestep=int(timed_action.get_timestep()),
+                action_timestamp=float(timed_action.get_timestamp()),
+                pose7d_pre_adapter=pre_pose7d,
+                pose7d_post_adapter=post_pose7d,
+            )
 
         if verbose:
             with self.action_queue_lock:

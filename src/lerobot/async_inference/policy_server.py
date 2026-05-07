@@ -57,6 +57,7 @@ from lerobot.utils.constants import OBS_STATE
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
+from .jitter_dump import JitterDumpWriter, chunk_intra_diff_stats
 from .helpers import (
     FPSTracker,
     Observation,
@@ -82,6 +83,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._result_dump_root = config.result_dump_path
         if self._result_dump_root is not None:
             self._result_dump_root.mkdir(parents=True, exist_ok=True)
+
+        self._jitter_dump = JitterDumpWriter(config.jitter_dump_dir)
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=config.fps)
@@ -708,6 +711,26 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         start_pose_convert = time.perf_counter()
         action_tensor = pose10d_to_pose7d(action_tensor)
         pose_convert_time = time.perf_counter() - start_pose_convert
+
+        if self._jitter_dump.enabled:
+            chunk_np = action_tensor.detach().cpu().numpy()
+            obs_step = int(observation_t.get_timestep())
+            self._jitter_dump.write_chunk(
+                obs_step=obs_step,
+                first_action_step=obs_step + 1,
+                obs_timestamp=float(observation_t.get_timestamp()),
+                chunk=chunk_np,
+                extra={"safe_return": bool(self.config.pose_act_safe_return_current_pose)},
+            )
+            stats = chunk_intra_diff_stats(chunk_np)
+            self.logger.info(
+                f"PoseACT chunk diag obs_step={obs_step} "
+                f"xyz_step_max={stats['xyz_step_max']:.4f} "
+                f"xyz_step_rms={stats['xyz_step_rms']:.4f} "
+                f"rpy_step_max={stats['rpy_step_max']:.4f} "
+                f"rpy_step_rms={stats['rpy_step_rms']:.4f} "
+                f"gripper_step_max={stats['gripper_step_max']:.4f}"
+            )
 
         if self.config.pose_act_safe_return_current_pose:
             action_tensor = self._build_pose_act_safe_return_pose7d_chunk(

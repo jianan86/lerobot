@@ -123,6 +123,14 @@ class PolicyServerConfig:
             "blocks inference."
         },
     )
+    jitter_dump_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional directory where each pose_act inference produces a chunk_dump.jsonl line "
+            "with the raw absolute pose7d chunk. Used together with the client-side dumps to diagnose "
+            "intra-chunk vs cross-chunk jitter."
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -140,6 +148,9 @@ class PolicyServerConfig:
 
         if self.result_dump_dir is not None and not str(self.result_dump_dir).strip():
             raise ValueError("result_dump_dir cannot be an empty string")
+
+        if self.jitter_dump_dir is not None and not str(self.jitter_dump_dir).strip():
+            raise ValueError("jitter_dump_dir cannot be an empty string")
 
     @property
     def result_dump_path(self) -> Path | None:
@@ -216,6 +227,15 @@ class RobotClientConfig:
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
     )
+    jitter_dump_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional directory where the client dumps aggregate_events.jsonl (cross-chunk "
+            "fusion events at overlapping timesteps) and executed.csv (final action sequence sent to "
+            "the robot). Used together with the server-side chunk_dump.jsonl to diagnose pose_act "
+            "jitter."
+        },
+    )
 
     @property
     def environment_dt(self) -> float:
@@ -249,6 +269,9 @@ class RobotClientConfig:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
+
+        if self.jitter_dump_dir is not None and not str(self.jitter_dump_dir).strip():
+            raise ValueError("jitter_dump_dir cannot be an empty string")
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "RobotClientConfig":
