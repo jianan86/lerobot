@@ -14,7 +14,6 @@ from typing import Any
 import torch
 
 from lerobot.async_inference.adapters.pose_act_piper import PoseActPiperAdapter
-from lerobot.datasets import LeRobotDataset
 from lerobot.robots import Robot
 from lerobot.utils.constants import ACTION
 from lerobot.utils.pose_act import absolute_pose10d, pose10d_to_pose7d, relative_pose10d
@@ -43,6 +42,12 @@ class RelativePoseChunk:
 class _LoadedEpisode:
     meta: EpisodeMeta
     relative_actions: torch.Tensor
+
+
+def _make_lerobot_dataset(repo_id: str, root: Path | None, episode_index: int):
+    from lerobot.datasets import LeRobotDataset
+
+    return LeRobotDataset(repo_id, root=root, episodes=[episode_index])
 
 
 def _validate_pose7d_action_names(names: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
@@ -115,7 +120,7 @@ class PiperReplayDatasetProvider:
         return episode
 
     def _load_episode(self, episode_index: int) -> _LoadedEpisode:
-        dataset = LeRobotDataset(self.repo_id, root=self.root, episodes=[episode_index])
+        dataset = _make_lerobot_dataset(self.repo_id, self.root, episode_index)
         actions = dataset.select_columns(ACTION)
         action_names = _validate_pose7d_action_names(dataset.features[ACTION]["names"])
         action_tensor = torch.stack(

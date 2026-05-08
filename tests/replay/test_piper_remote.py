@@ -120,7 +120,7 @@ def test_provider_returns_relative_chunk(monkeypatch):
         dtype=torch.float32,
     )
     monkeypatch.setattr(
-        "lerobot.replay.piper_remote.LeRobotDataset",
+        "lerobot.replay.piper_remote._make_lerobot_dataset",
         lambda *args, **kwargs: _FakeDataset(actions, fps=60),
     )
 
@@ -138,7 +138,7 @@ def test_provider_returns_relative_chunk(monkeypatch):
 def test_provider_rejects_bad_action_schema(monkeypatch):
     actions = torch.zeros(2, 7, dtype=torch.float32)
     monkeypatch.setattr(
-        "lerobot.replay.piper_remote.LeRobotDataset",
+        "lerobot.replay.piper_remote._make_lerobot_dataset",
         lambda *args, **kwargs: _FakeDataset(actions, names=("joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper")),
     )
 
@@ -185,7 +185,7 @@ def test_transport_roundtrip_over_socket(monkeypatch):
         dtype=torch.float32,
     )
     monkeypatch.setattr(
-        "lerobot.replay.piper_remote.LeRobotDataset",
+        "lerobot.replay.piper_remote._make_lerobot_dataset",
         lambda *args, **kwargs: _FakeDataset(actions, fps=25),
     )
 
