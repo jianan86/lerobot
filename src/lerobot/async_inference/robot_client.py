@@ -70,7 +70,7 @@ from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
 from .adapters import POSE7D_NAMES, PoseActPiperAdapter, is_pose_act_piper
 from .configs import RobotClientConfig
-from .jitter_dump import JitterDumpWriter
+from .async_diagnostics import AsyncDiagnosticsWriter
 from .helpers import (
     Action,
     FPSTracker,
@@ -139,7 +139,8 @@ class RobotClient:
         self.action_queue_lock = threading.Lock()  # Protect queue operations
         self.action_queue_size = []
 
-        self._jitter_dump = JitterDumpWriter(config.jitter_dump_dir)
+        self._diagnostics = AsyncDiagnosticsWriter(config.effective_diagnostics_dump_dir)
+        self._async_loop_request_id = 0
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
 
         # FPS measurement
@@ -298,16 +299,17 @@ class RobotClient:
                     timestamp=new_action.get_timestamp(),
                     timestep=new_action.get_timestep(),
                     action=agg_tensor,
+                    request_id=new_action.request_id,
                 )
             )
-            if self._jitter_dump.enabled:
+            if self._diagnostics.enabled:
                 try:
                     old_seq = old_action.detach().cpu().flatten().tolist()
                     new_seq = new_tensor.detach().cpu().flatten().tolist()
                     agg_seq = agg_tensor.detach().cpu().flatten().tolist()
                 except Exception:
                     continue
-                self._jitter_dump.write_aggregate_event(
+                self._diagnostics.write_aggregate_event(
                     timestep=int(new_action.get_timestep()),
                     old=old_seq[:7],
                     new=new_seq[:7],
@@ -357,27 +359,23 @@ class RobotClient:
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
 
+                with self.latest_action_lock:
+                    latest_action_before_merge = self.latest_action
+                old_size, old_timesteps = self._inspect_action_queue()
+                old_timestep_set = set(old_timesteps)
+                incoming_timesteps = [a.get_timestep() for a in timed_actions]
+
                 # Calculate network latency if we have matching observations
                 if len(timed_actions) > 0 and verbose:
-                    with self.latest_action_lock:
-                        latest_action = self.latest_action
-
-                    self.logger.debug(f"Current latest action: {latest_action}")
-
-                    # Get queue state before changes
-                    old_size, old_timesteps = self._inspect_action_queue()
                     if not old_timesteps:
-                        old_timesteps = [latest_action]  # queue was empty
-
-                    # Log incoming actions
-                    incoming_timesteps = [a.get_timestep() for a in timed_actions]
+                        old_timesteps = [latest_action_before_merge]  # queue was empty
 
                     first_action_timestep = timed_actions[0].get_timestep()
                     server_to_client_latency = (receive_time - timed_actions[0].get_timestamp()) * 1000
 
                     self.logger.info(
                         f"Received action chunk for step #{first_action_timestep} | "
-                        f"Latest action: #{latest_action} | "
+                        f"Latest action: #{latest_action_before_merge} | "
                         f"Incoming actions: {incoming_timesteps[0]}:{incoming_timesteps[-1]} | "
                         f"Network latency (server->client): {server_to_client_latency:.2f}ms | "
                         f"Deserialization time: {deserialize_time * 1000:.2f}ms"
@@ -387,13 +385,39 @@ class RobotClient:
                 start_time = time.perf_counter()
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - start_time
+                new_size, new_timesteps = self._inspect_action_queue()
+
+                if self._diagnostics.enabled and timed_actions:
+                    request_id = timed_actions[0].request_id
+                    stale_actions = sum(1 for a in timed_actions if a.get_timestep() <= latest_action_before_merge)
+                    overlap_actions = sum(1 for a in timed_actions if a.get_timestep() in old_timestep_set)
+                    overlap_actions -= sum(
+                        1
+                        for a in timed_actions
+                        if a.get_timestep() <= latest_action_before_merge and a.get_timestep() in old_timestep_set
+                    )
+                    new_actions = max(0, len(timed_actions) - stale_actions - overlap_actions)
+                    self._diagnostics.write_async_loop_event(
+                        "client_chunk_merge",
+                        request_id=request_id,
+                        receive_wallclock=float(receive_time),
+                        latest_action_at_receive=int(latest_action_before_merge),
+                        queue_size_before=int(old_size),
+                        queue_size_after=int(new_size),
+                        incoming_first_step=int(incoming_timesteps[0]),
+                        incoming_last_step=int(incoming_timesteps[-1]),
+                        stale_actions=int(stale_actions),
+                        overlap_actions=int(overlap_actions),
+                        new_actions=int(new_actions),
+                        dropped_old_actions=int(max(0, old_size - overlap_actions)),
+                        deserialize_ms=float(deserialize_time * 1000),
+                        queue_update_ms=float(queue_update_time * 1000),
+                    )
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
                 if verbose:
                     # Get queue state after changes
-                    new_size, new_timesteps = self._inspect_action_queue()
-
                     with self.latest_action_lock:
                         latest_action = self.latest_action
 
@@ -441,7 +465,7 @@ class RobotClient:
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
 
-        if self._jitter_dump.enabled:
+        if self._diagnostics.enabled:
             try:
                 pre_pose7d = timed_action.get_action().detach().cpu().flatten().tolist()
             except Exception:
@@ -464,11 +488,18 @@ class RobotClient:
             except Exception:
                 post_pose7d = None
 
-            self._jitter_dump.write_executed(
+            self._diagnostics.write_executed(
                 timestep=int(timed_action.get_timestep()),
                 action_timestamp=float(timed_action.get_timestamp()),
                 pose7d_pre_adapter=pre_pose7d,
                 pose7d_post_adapter=post_pose7d,
+            )
+            self._diagnostics.write_async_loop_event(
+                "client_action_executed",
+                request_id=timed_action.request_id,
+                timestep=int(timed_action.get_timestep()),
+                queue_size_after_pop=int(self.action_queue.qsize()),
+                latest_action=int(self.latest_action),
             )
 
         if verbose:
@@ -561,8 +592,28 @@ class RobotClient:
             with self.action_queue_lock:
                 observation.must_go = self.must_go.is_set() and self.action_queue.empty()
                 current_queue_size = self.action_queue.qsize()
+            queue_ratio = current_queue_size / max(1, self.action_chunk_size)
+            request_id = self._async_loop_request_id
+            self._async_loop_request_id += 1
+            raw_observation["async_loop_request_id"] = request_id
 
             _ = self.send_observation(observation)
+            if self._diagnostics.enabled:
+                self._diagnostics.write_async_loop_event(
+                    "client_request_sent",
+                    request_id=int(request_id),
+                    send_wallclock=float(observation.get_timestamp()),
+                    observation_timestep=int(observation.get_timestep()),
+                    latest_action_at_send=int(latest_action),
+                    queue_size_at_send=int(current_queue_size),
+                    queue_ratio_at_send=float(queue_ratio),
+                    action_chunk_size=int(self.action_chunk_size),
+                    chunk_size_threshold=float(self._chunk_size_threshold),
+                    must_go=bool(observation.must_go),
+                    obs_capture_ms=float(obs_capture_time * 1000),
+                    fps=float(self.config.fps),
+                    actions_per_chunk=int(self.config.actions_per_chunk),
+                )
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
             if observation.must_go:
@@ -602,6 +653,14 @@ class RobotClient:
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
                 _performed_action = self.control_loop_action(verbose)
+            elif self._diagnostics.enabled:
+                with self.latest_action_lock:
+                    latest_action = self.latest_action
+                self._diagnostics.write_async_loop_event(
+                    "client_control_underrun",
+                    latest_action=int(latest_action),
+                    queue_size=0,
+                )
 
             """Control loop: (2) Streaming observations to the remote policy server"""
             if self._ready_to_send_observation():

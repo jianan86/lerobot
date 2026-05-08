@@ -126,9 +126,14 @@ class PolicyServerConfig:
     jitter_dump_dir: str | None = field(
         default=None,
         metadata={
-            "help": "Optional directory where each pose_act inference produces a chunk_dump.jsonl line "
-            "with the raw absolute pose7d chunk. Used together with the client-side dumps to diagnose "
-            "intra-chunk vs cross-chunk jitter."
+            "help": "Deprecated alias for diagnostics_dump_dir."
+        },
+    )
+    diagnostics_dump_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional directory for async diagnostics. Includes pose_act jitter files and "
+            "async_loop_events.jsonl timing events."
         },
     )
 
@@ -151,6 +156,13 @@ class PolicyServerConfig:
 
         if self.jitter_dump_dir is not None and not str(self.jitter_dump_dir).strip():
             raise ValueError("jitter_dump_dir cannot be an empty string")
+
+        if self.diagnostics_dump_dir is not None and not str(self.diagnostics_dump_dir).strip():
+            raise ValueError("diagnostics_dump_dir cannot be an empty string")
+
+    @property
+    def effective_diagnostics_dump_dir(self) -> str | None:
+        return self.diagnostics_dump_dir if self.diagnostics_dump_dir is not None else self.jitter_dump_dir
 
     @property
     def result_dump_path(self) -> Path | None:
@@ -230,10 +242,14 @@ class RobotClientConfig:
     jitter_dump_dir: str | None = field(
         default=None,
         metadata={
-            "help": "Optional directory where the client dumps aggregate_events.jsonl (cross-chunk "
-            "fusion events at overlapping timesteps) and executed.csv (final action sequence sent to "
-            "the robot). Used together with the server-side chunk_dump.jsonl to diagnose pose_act "
-            "jitter."
+            "help": "Deprecated alias for diagnostics_dump_dir."
+        },
+    )
+    diagnostics_dump_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional directory for async diagnostics. Includes pose_act jitter files and "
+            "async_loop_events.jsonl timing events."
         },
     )
 
@@ -272,6 +288,13 @@ class RobotClientConfig:
 
         if self.jitter_dump_dir is not None and not str(self.jitter_dump_dir).strip():
             raise ValueError("jitter_dump_dir cannot be an empty string")
+
+        if self.diagnostics_dump_dir is not None and not str(self.diagnostics_dump_dir).strip():
+            raise ValueError("diagnostics_dump_dir cannot be an empty string")
+
+    @property
+    def effective_diagnostics_dump_dir(self) -> str | None:
+        return self.diagnostics_dump_dir if self.diagnostics_dump_dir is not None else self.jitter_dump_dir
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "RobotClientConfig":

@@ -57,7 +57,7 @@ from lerobot.utils.constants import OBS_STATE
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
-from .jitter_dump import JitterDumpWriter, chunk_intra_diff_stats
+from .async_diagnostics import AsyncDiagnosticsWriter, chunk_intra_diff_stats
 from .helpers import (
     FPSTracker,
     Observation,
@@ -84,7 +84,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if self._result_dump_root is not None:
             self._result_dump_root.mkdir(parents=True, exist_ok=True)
 
-        self._jitter_dump = JitterDumpWriter(config.jitter_dump_dir)
+        self._diagnostics = AsyncDiagnosticsWriter(config.effective_diagnostics_dump_dir)
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=config.fps)
@@ -428,9 +428,26 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Deserialization time: {deserialize_time:.6f}s"
         )
 
-        if not self._enqueue_observation(
+        request_id = timed_observation.get_observation().get("async_loop_request_id")
+        queue_was_full = self.observation_queue.full()
+        enqueued = self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
-        ):
+        )
+        if self._diagnostics.enabled:
+            self._diagnostics.write_async_loop_event(
+                "server_observation_received",
+                request_id=request_id,
+                receive_wallclock=float(receive_time),
+                observation_timestep=int(obs_timestep),
+                client_send_wallclock=float(obs_timestamp),
+                client_to_server_ms=float((receive_time - obs_timestamp) * 1000),
+                deserialize_ms=float(deserialize_time * 1000),
+                enqueued=bool(enqueued),
+                replaced_queued_observation=bool(queue_was_full and enqueued),
+                queue_size_after=int(self.observation_queue.qsize()),
+            )
+
+        if not enqueued:
             self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
 
         return services_pb2.Empty()
@@ -480,6 +497,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             time.sleep(
                 max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
             )  # sleep controls inference latency
+
+            if self._diagnostics.enabled and action_chunk:
+                raw_observation = obs.get_observation()
+                self._diagnostics.write_async_loop_event(
+                    "server_actions_ready",
+                    request_id=raw_observation.get("async_loop_request_id"),
+                    response_wallclock=float(time.time()),
+                    observation_timestep=int(obs.get_timestep()),
+                    server_processing_ms=float((time.perf_counter() - getactions_starts) * 1000),
+                    model_path_ms=float(inference_time * 1000),
+                    serialize_ms=float(serialize_time * 1000),
+                    chunk_size=int(len(action_chunk)),
+                    first_action_timestep=int(action_chunk[0].get_timestep()),
+                    last_action_timestep=int(action_chunk[-1].get_timestep()),
+                )
 
             return actions
 
@@ -537,13 +569,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+    def _time_action_chunk(
+        self,
+        t_0: float,
+        action_chunk: list[torch.Tensor],
+        i_0: int,
+        request_id: int | None = None,
+    ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
         return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
+            TimedAction(
+                timestamp=t_0 + i * self.config.environment_dt,
+                timestep=i_0 + i,
+                action=action,
+                request_id=request_id,
+            )
             for i, action in enumerate(action_chunk)
         ]
 
@@ -712,10 +755,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         action_tensor = pose10d_to_pose7d(action_tensor)
         pose_convert_time = time.perf_counter() - start_pose_convert
 
-        if self._jitter_dump.enabled:
+        if self._diagnostics.enabled:
             chunk_np = action_tensor.detach().cpu().numpy()
             obs_step = int(observation_t.get_timestep())
-            self._jitter_dump.write_chunk(
+            self._diagnostics.write_chunk(
                 obs_step=obs_step,
                 first_action_step=obs_step + 1,
                 obs_timestamp=float(observation_t.get_timestamp()),
@@ -742,7 +785,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             )
 
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            request_id=observation_t.get_observation().get("async_loop_request_id"),
         )
         total_time = time.perf_counter() - start_prepare
 
@@ -844,7 +890,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         action_tensor = self._build_shell_chunk(motion_mode, action_dim, observation_t)
         self.last_processed_obs = observation_t
         return self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            request_id=observation_t.get_observation().get("async_loop_request_id"),
         )
 
     def _build_shell_chunk(
@@ -965,7 +1014,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            request_id=observation_t.get_observation().get("async_loop_request_id"),
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
