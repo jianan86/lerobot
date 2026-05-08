@@ -1,15 +1,18 @@
 """Offline analyzer for pose_act jitter dumps.
 
-Reads three dump files produced by the async-inference stack when
-``jitter_dump_dir`` is enabled and prints the A/B/C metrics that separate
+Reads three pose_act diagnostic files produced by the async-inference stack when
+``diagnostics_dump_dir`` is enabled and prints the A/B/C metrics that separate
 intra-chunk smoothness, cross-chunk fusion jumps, and the executed action
 sequence. The verdict at the bottom points to the dominant jitter source.
 
 Inputs (under ``--dump_dir``):
 
-- ``chunk_dump.jsonl``         : server-side raw absolute pose7d chunks
-- ``aggregate_events.jsonl``   : client-side fusion events at overlapping timesteps
-- ``executed.csv``             : client-side pose7d sent to the robot
+- ``pose_act_chunks.jsonl``           : server-side raw absolute pose7d chunks
+- ``pose_act_fusion_events.jsonl``    : client-side fusion events at overlapping timesteps
+- ``pose_act_executed_actions.csv``   : client-side pose7d sent to the robot
+
+The old filenames ``chunk_dump.jsonl``, ``aggregate_events.jsonl``, and
+``executed.csv`` are still accepted for compatibility.
 
 Optional plotting (``--plot``) requires matplotlib.
 
@@ -138,6 +141,14 @@ def load_executed(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return timesteps_arr, pre, post
 
 
+def _first_existing(dump_dir: Path, names: tuple[str, ...]) -> Path:
+    for name in names:
+        path = dump_dir / name
+        if path.exists():
+            return path
+    return dump_dir / names[0]
+
+
 def _summarize(diffs: np.ndarray) -> dict:
     """diffs: [K, D]; returns scalar stats over the L2 norm of each row."""
     if diffs.size == 0:
@@ -152,10 +163,13 @@ def _summarize(diffs: np.ndarray) -> dict:
 
 
 def metric_a_intra_chunk(chunks: list[Chunk]) -> dict:
-    """Per-chunk first-difference of (xyz) and (rpy with unwrap)."""
+    """Per-chunk first/second-difference of (xyz) and (rpy with unwrap)."""
     xyz_diffs = []
     rpy_diffs = []
     grip_diffs = []
+    xyz_second_diffs = []
+    rpy_second_diffs = []
+    grip_second_diffs = []
     for c in chunks:
         if c.actions.shape[0] < 2:
             continue
@@ -163,13 +177,25 @@ def metric_a_intra_chunk(chunks: list[Chunk]) -> dict:
         rpy_unwrapped = _unwrap_chunk_rpy(c.actions[:, 3:6])
         rpy_diffs.append(np.diff(rpy_unwrapped, axis=0))
         grip_diffs.append(np.diff(c.actions[:, 6:7], axis=0))
+        if c.actions.shape[0] >= 3:
+            xyz_second_diffs.append(np.diff(c.actions[:, :3], n=2, axis=0))
+            rpy_second_diffs.append(np.diff(rpy_unwrapped, n=2, axis=0))
+            grip_second_diffs.append(np.diff(c.actions[:, 6:7], n=2, axis=0))
     xyz = np.concatenate(xyz_diffs, axis=0) if xyz_diffs else np.zeros((0, 3))
     rpy = np.concatenate(rpy_diffs, axis=0) if rpy_diffs else np.zeros((0, 3))
     grip = np.concatenate(grip_diffs, axis=0) if grip_diffs else np.zeros((0, 1))
+    xyz_second = np.concatenate(xyz_second_diffs, axis=0) if xyz_second_diffs else np.zeros((0, 3))
+    rpy_second = np.concatenate(rpy_second_diffs, axis=0) if rpy_second_diffs else np.zeros((0, 3))
+    grip_second = np.concatenate(grip_second_diffs, axis=0) if grip_second_diffs else np.zeros((0, 1))
     return {
         "xyz": _summarize(xyz),
         "rpy": _summarize(rpy),
         "gripper": _summarize(grip),
+        "second_difference": {
+            "xyz": _summarize(xyz_second),
+            "rpy": _summarize(rpy_second),
+            "gripper": _summarize(grip_second),
+        },
     }
 
 
@@ -230,14 +256,27 @@ def metric_c_executed(executed: tuple[np.ndarray, np.ndarray, np.ndarray]) -> di
     out: dict = {}
     for tag, arr in (("pre", pre), ("post", post)):
         if arr.shape[0] < 2:
-            out[tag] = {"xyz": _summarize(np.zeros((0, 3))), "rpy": _summarize(np.zeros((0, 3)))}
+            out[tag] = {
+                "xyz": _summarize(np.zeros((0, 3))),
+                "rpy": _summarize(np.zeros((0, 3))),
+                "second_difference": {
+                    "xyz": _summarize(np.zeros((0, 3))),
+                    "rpy": _summarize(np.zeros((0, 3))),
+                },
+            }
             continue
         rpy_unwrapped = _unwrap_chunk_rpy(arr[:, 3:6])
         diff_xyz = np.diff(arr[:, :3], axis=0)
         diff_rpy = np.diff(rpy_unwrapped, axis=0)
+        second_diff_xyz = np.diff(arr[:, :3], n=2, axis=0) if arr.shape[0] >= 3 else np.zeros((0, 3))
+        second_diff_rpy = np.diff(rpy_unwrapped, n=2, axis=0) if arr.shape[0] >= 3 else np.zeros((0, 3))
         out[tag] = {
             "xyz": _summarize(diff_xyz),
             "rpy": _summarize(diff_rpy),
+            "second_difference": {
+                "xyz": _summarize(second_diff_xyz),
+                "rpy": _summarize(second_diff_rpy),
+            },
         }
     return out
 
@@ -332,9 +371,13 @@ def main() -> int:
         print(f"dump_dir does not exist: {dump_dir}")
         return 1
 
-    chunks = load_chunks(dump_dir / "chunk_dump.jsonl")
-    events = load_aggregate_events(dump_dir / "aggregate_events.jsonl")
-    executed = load_executed(dump_dir / "executed.csv")
+    chunks = load_chunks(_first_existing(dump_dir, ("pose_act_chunks.jsonl", "chunk_dump.jsonl")))
+    events = load_aggregate_events(
+        _first_existing(dump_dir, ("pose_act_fusion_events.jsonl", "aggregate_events.jsonl"))
+    )
+    executed = load_executed(
+        _first_existing(dump_dir, ("pose_act_executed_actions.csv", "executed.csv"))
+    )
 
     print(f"loaded {len(chunks)} chunks | {len(events)} aggregate events | {executed[0].shape[0]} executed actions")
     if not chunks:
@@ -346,13 +389,13 @@ def main() -> int:
     c = metric_c_executed(executed)
 
     print()
-    print("=== A: intra-chunk first-difference ===")
+    print("=== A: intra-chunk first/second-difference ===")
     print(json.dumps(a, indent=2))
     print()
     print("=== B: cross-chunk overlap (chunk_k vs chunk_{k+1}) ===")
     print(json.dumps(b, indent=2))
     print()
-    print("=== C: executed trajectory first-difference ===")
+    print("=== C: executed trajectory first/second-difference ===")
     print(json.dumps(c, indent=2))
     print()
     print("=== Verdict ===")
