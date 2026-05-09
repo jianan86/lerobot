@@ -5,6 +5,7 @@ import pytest
 from tools.simulate_pose_act_async_loop import (
     SimConfig,
     derive_config_from_actual,
+    _load_async_loop_events,
     merge_chunk_queue,
     run_simulation,
     summarize_actual_events,
@@ -162,3 +163,22 @@ def test_actual_events_can_derive_config_and_summary():
     assert cfg.chunk_size_threshold == pytest.approx(0.4)
     assert cfg.server_processing_ms == pytest.approx(200.0)
     assert cfg.client_to_server_ms == pytest.approx(50.0)
+
+
+def test_load_async_loop_events_accepts_split_client_server_files(tmp_path):
+    (tmp_path / "async_loop_events_server.jsonl").write_text(
+        '{"event":"server_actions_ready","wallclock":2.0}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "async_loop_events_client.jsonl").write_text(
+        '{"event":"client_request_sent","wallclock":1.0}\n',
+        encoding="utf-8",
+    )
+
+    events = _load_async_loop_events(tmp_path)
+
+    assert [event["event"] for event in events] == ["client_request_sent", "server_actions_ready"]
+    assert [event["source_file"] for event in events] == [
+        "async_loop_events_client.jsonl",
+        "async_loop_events_server.jsonl",
+    ]

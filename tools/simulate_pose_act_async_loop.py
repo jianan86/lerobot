@@ -315,16 +315,26 @@ def _mean(values: list[float]) -> float:
 
 
 def _load_async_loop_events(actual_dir: Path) -> list[dict[str, Any]]:
-    path = actual_dir / "async_loop_events.jsonl"
-    if not path.exists():
-        raise FileNotFoundError(f"missing async loop events file: {path}")
+    standard_path = actual_dir / "async_loop_events.jsonl"
+    if standard_path.exists():
+        paths = [standard_path]
+    else:
+        paths = sorted(actual_dir.glob("*async_loop_events*.jsonl"))
+    if not paths:
+        raise FileNotFoundError(
+            f"missing async loop events file under {actual_dir}; expected async_loop_events.jsonl "
+            "or split files like async_loop_events_client.jsonl / async_loop_events_server.jsonl"
+        )
     events: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                events.append(json.loads(line))
-    return events
+    for path in paths:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    event = json.loads(line)
+                    event.setdefault("source_file", path.name)
+                    events.append(event)
+    return sorted(events, key=lambda event: float(event.get("wallclock", 0.0)))
 
 
 def _events_by_name(events: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
