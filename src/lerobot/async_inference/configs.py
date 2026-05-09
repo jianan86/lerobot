@@ -26,16 +26,18 @@ from .constants import (
     DEFAULT_OBS_QUEUE_TIMEOUT,
 )
 
-# Aggregate function registry for CLI usage
+# Aggregate function registry for CLI usage. "rtc_smooth" is context-aware and
+# is handled directly by RobotClient instead of this pairwise registry.
 AGGREGATE_FUNCTIONS = {
     "weighted_average": lambda old, new: 0.3 * old + 0.7 * new,
     "latest_only": lambda old, new: new,
     "average": lambda old, new: 0.5 * old + 0.5 * new,
     "conservative": lambda old, new: 0.7 * old + 0.3 * new,
+    "rtc_smooth": None,
 }
 
 
-def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None:
     """Get aggregate function by name from registry."""
     if name not in AGGREGATE_FUNCTIONS:
         available = list(AGGREGATE_FUNCTIONS.keys())
@@ -234,6 +236,18 @@ class RobotClientConfig:
         default="weighted_average",
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
+    rtc_smooth_safe_prefix_steps: int = field(
+        default=2,
+        metadata={"help": "For aggregate_fn_name=rtc_smooth, keep this many imminent old actions unchanged."},
+    )
+    rtc_smooth_blend_steps: int = field(
+        default=6,
+        metadata={"help": "For aggregate_fn_name=rtc_smooth, blend this many overlapping old/new actions."},
+    )
+    rtc_smooth_exp_schedule: bool = field(
+        default=True,
+        metadata={"help": "For aggregate_fn_name=rtc_smooth, use an exponential old-action decay schedule."},
+    )
 
     # Debug configuration
     debug_visualize_queue_size: bool = field(
@@ -284,6 +298,17 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.rtc_smooth_safe_prefix_steps < 0:
+            raise ValueError(
+                "rtc_smooth_safe_prefix_steps must be non-negative, "
+                f"got {self.rtc_smooth_safe_prefix_steps}"
+            )
+
+        if self.rtc_smooth_blend_steps < 0:
+            raise ValueError(
+                f"rtc_smooth_blend_steps must be non-negative, got {self.rtc_smooth_blend_steps}"
+            )
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
         if self.jitter_dump_dir is not None and not str(self.jitter_dump_dir).strip():
@@ -315,4 +340,7 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "rtc_smooth_safe_prefix_steps": self.rtc_smooth_safe_prefix_steps,
+            "rtc_smooth_blend_steps": self.rtc_smooth_blend_steps,
+            "rtc_smooth_exp_schedule": self.rtc_smooth_exp_schedule,
         }

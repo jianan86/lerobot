@@ -34,6 +34,7 @@ python src/lerobot/async_inference/robot_client.py \
 """
 
 import logging
+import math
 import pickle  # nosec
 import threading
 import time
@@ -259,8 +260,13 @@ class RobotClient:
         self,
         incoming_actions: list[TimedAction],
         aggregate_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        receive_time: float | None = None,
     ):
         """Finds the same timestep actions in the queue and aggregates them using the aggregate_fn"""
+        if self.config.aggregate_fn_name == "rtc_smooth":
+            self._aggregate_action_queues_rtc_smooth(incoming_actions, receive_time=receive_time)
+            return
+
         if aggregate_fn is None:
             # default aggregate function: take the latest action
             def aggregate_fn(x1, x2):
@@ -318,6 +324,135 @@ class RobotClient:
                     incoming_first_step=int(incoming_first_step),
                     incoming_last_step=int(incoming_last_step),
                 )
+
+        with self.action_queue_lock:
+            self.action_queue = future_action_queue
+
+    def _rtc_smooth_old_weight(self, blend_index: int, blend_steps: int) -> float:
+        if blend_steps <= 0:
+            return 0.0
+
+        progress = (blend_index + 1) / (blend_steps + 1)
+        old_weight = 1.0 - progress
+        if self.config.rtc_smooth_exp_schedule:
+            old_weight = old_weight * math.expm1(old_weight) / (math.e - 1)
+        return float(max(0.0, min(1.0, old_weight)))
+
+    def _write_rtc_smooth_aggregate_event(
+        self,
+        old_action: torch.Tensor,
+        new_action: torch.Tensor,
+        agg_tensor: torch.Tensor,
+        new_timed_action: TimedAction,
+        incoming_first_step: int,
+        incoming_last_step: int,
+    ) -> None:
+        if not self._diagnostics.enabled:
+            return
+        try:
+            old_seq = old_action.detach().cpu().flatten().tolist()
+            new_seq = new_action.detach().cpu().flatten().tolist()
+            agg_seq = agg_tensor.detach().cpu().flatten().tolist()
+        except Exception:
+            return
+        self._diagnostics.write_aggregate_event(
+            timestep=int(new_timed_action.get_timestep()),
+            old=old_seq[:7],
+            new=new_seq[:7],
+            agg=agg_seq[:7],
+            fn_name=self.config.aggregate_fn_name,
+            incoming_first_step=int(incoming_first_step),
+            incoming_last_step=int(incoming_last_step),
+        )
+
+    def _aggregate_action_queues_rtc_smooth(
+        self,
+        incoming_actions: list[TimedAction],
+        receive_time: float | None = None,
+    ):
+        """RTC-style client-side chunk merge.
+
+        Keeps imminent old actions stable, blends a short old/new overlap, and
+        lets farther-future actions come from the newest chunk.
+        """
+        with self.latest_action_lock:
+            latest_action = self.latest_action
+        with self.action_queue_lock:
+            old_actions = list(self.action_queue.queue)
+
+        old_live = [action for action in old_actions if action.get_timestep() > latest_action]
+        incoming_live = [
+            action
+            for action in incoming_actions
+            if action.get_timestep() > latest_action
+            and (receive_time is None or action.get_timestamp() > receive_time)
+        ]
+
+        future_action_queue = Queue()
+        if not incoming_live:
+            for old_action in old_live:
+                future_action_queue.put(old_action)
+            with self.action_queue_lock:
+                self.action_queue = future_action_queue
+            return
+
+        safe_prefix_steps = self.config.rtc_smooth_safe_prefix_steps
+        blend_steps = self.config.rtc_smooth_blend_steps
+        incoming_first_step = incoming_live[0].get_timestep()
+        incoming_last_step = incoming_live[-1].get_timestep()
+
+        old_by_timestep = {action.get_timestep(): action for action in old_live}
+        incoming_by_timestep = {action.get_timestep(): action for action in incoming_live}
+        safe_timesteps = {action.get_timestep() for action in old_live[:safe_prefix_steps]}
+
+        output_by_timestep: dict[int, TimedAction] = {}
+        for old_action in old_live[:safe_prefix_steps]:
+            output_by_timestep[old_action.get_timestep()] = old_action
+
+        blend_index = 0
+        for new_action in incoming_live:
+            timestep = new_action.get_timestep()
+            if timestep in safe_timesteps:
+                continue
+
+            old_timed_action = old_by_timestep.get(timestep)
+            if old_timed_action is None:
+                output_by_timestep[timestep] = new_action
+                continue
+
+            if blend_index >= blend_steps:
+                output_by_timestep[timestep] = new_action
+                continue
+
+            old_tensor = old_timed_action.get_action()
+            new_tensor = new_action.get_action()
+            old_weight = self._rtc_smooth_old_weight(blend_index, blend_steps)
+            agg_tensor = old_weight * old_tensor + (1.0 - old_weight) * new_tensor
+            output_by_timestep[timestep] = TimedAction(
+                timestamp=new_action.get_timestamp(),
+                timestep=timestep,
+                action=agg_tensor,
+                request_id=new_action.request_id,
+            )
+            self._write_rtc_smooth_aggregate_event(
+                old_tensor,
+                new_tensor,
+                agg_tensor,
+                new_action,
+                incoming_first_step,
+                incoming_last_step,
+            )
+            blend_index += 1
+
+        for old_action in old_live:
+            timestep = old_action.get_timestep()
+            if timestep in output_by_timestep or timestep in incoming_by_timestep:
+                continue
+            if timestep < incoming_first_step:
+                output_by_timestep[timestep] = old_action
+
+        for timestep in sorted(output_by_timestep):
+            future_action_queue.put(output_by_timestep[timestep])
 
         with self.action_queue_lock:
             self.action_queue = future_action_queue
@@ -383,7 +518,7 @@ class RobotClient:
 
                 # Update action queue
                 start_time = time.perf_counter()
-                self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
+                self._aggregate_action_queues(timed_actions, self.config.aggregate_fn, receive_time=receive_time)
                 queue_update_time = time.perf_counter() - start_time
                 new_size, new_timesteps = self._inspect_action_queue()
 

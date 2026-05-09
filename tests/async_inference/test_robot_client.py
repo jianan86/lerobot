@@ -87,6 +87,24 @@ def _make_actions(start_ts: float, start_t: int, count: int):
     return actions
 
 
+def _make_constant_actions(start_ts: float, start_t: int, values: list[float]):
+    from lerobot.async_inference.helpers import TimedAction
+
+    return [
+        TimedAction(
+            action=torch.full((6,), value, dtype=torch.float32),
+            timestep=start_t + i,
+            timestamp=start_ts + i * (1 / 30),
+        )
+        for i, value in enumerate(values)
+    ]
+
+
+def _queue_timesteps_and_values(queue: Queue) -> tuple[list[int], list[float]]:
+    actions = list(queue.queue)
+    return [a.get_timestep() for a in actions], [float(a.get_action()[0].item()) for a in actions]
+
+
 class _StubPoseActPiperRobot:
     def __init__(self, fps: int = 30):
         self.fps = fps
@@ -235,6 +253,132 @@ def test_aggregate_action_queues_combines_actions_in_overlap(
         weight_old * current_actions[1].get_action() + weight_new * incoming[-2].get_action(),
     )
     assert torch.allclose(queue_non_overlap_actions[0].get_action(), incoming[-1].get_action())
+
+
+def test_robot_client_config_accepts_rtc_smooth_aggregate_fn():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        aggregate_fn_name="rtc_smooth",
+    )
+
+    assert cfg.aggregate_fn is None
+
+
+def test_robot_client_config_rejects_invalid_aggregate_fn():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match="Unknown aggregate function"):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            server_address="localhost:9999",
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            aggregate_fn_name="unknown",
+        )
+
+
+def test_robot_client_config_rejects_invalid_rtc_smooth_steps():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match="rtc_smooth_safe_prefix_steps"):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            server_address="localhost:9999",
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            aggregate_fn_name="rtc_smooth",
+            rtc_smooth_safe_prefix_steps=-1,
+        )
+
+    with pytest.raises(ValueError, match="rtc_smooth_blend_steps"):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            server_address="localhost:9999",
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            aggregate_fn_name="rtc_smooth",
+            rtc_smooth_blend_steps=-1,
+        )
+
+
+def test_rtc_smooth_keeps_safe_prefix_blends_overlap_and_replaces_future(robot_client):
+    robot_client.config.aggregate_fn_name = "rtc_smooth"
+    robot_client.config.rtc_smooth_safe_prefix_steps = 1
+    robot_client.config.rtc_smooth_blend_steps = 3
+    robot_client.config.rtc_smooth_exp_schedule = False
+    robot_client.latest_action = 4
+
+    for action in _make_constant_actions(start_ts=100.0, start_t=5, values=[0, 0, 0, 0, 0]):
+        robot_client.action_queue.put(action)
+    incoming = _make_constant_actions(start_ts=101.0, start_t=5, values=[10, 10, 10, 10, 10, 10])
+
+    robot_client._aggregate_action_queues(incoming, receive_time=100.5)
+
+    timesteps, values = _queue_timesteps_and_values(robot_client.action_queue)
+    assert timesteps == [5, 6, 7, 8, 9, 10]
+    assert values == pytest.approx([0.0, 2.5, 5.0, 7.5, 10.0, 10.0])
+
+
+def test_rtc_smooth_drops_stale_and_expired_incoming_actions(robot_client):
+    robot_client.config.aggregate_fn_name = "rtc_smooth"
+    robot_client.config.rtc_smooth_safe_prefix_steps = 2
+    robot_client.config.rtc_smooth_blend_steps = 2
+    robot_client.latest_action = 4
+
+    for action in _make_constant_actions(start_ts=100.0, start_t=5, values=[50, 60]):
+        robot_client.action_queue.put(action)
+
+    incoming = _make_constant_actions(start_ts=99.90, start_t=3, values=[3, 4, 5, 6, 7, 8])
+
+    robot_client._aggregate_action_queues(incoming, receive_time=100.0)
+
+    timesteps, values = _queue_timesteps_and_values(robot_client.action_queue)
+    assert timesteps == [5, 6, 7, 8]
+    assert values == pytest.approx([50.0, 60.0, 7.0, 8.0])
+
+
+def test_rtc_smooth_keeps_old_queue_when_incoming_all_expired(robot_client):
+    robot_client.config.aggregate_fn_name = "rtc_smooth"
+    robot_client.latest_action = 4
+
+    for action in _make_constant_actions(start_ts=100.0, start_t=5, values=[50, 60, 70]):
+        robot_client.action_queue.put(action)
+    incoming = _make_constant_actions(start_ts=99.0, start_t=5, values=[5, 6, 7])
+
+    robot_client._aggregate_action_queues(incoming, receive_time=100.0)
+
+    timesteps, values = _queue_timesteps_and_values(robot_client.action_queue)
+    assert timesteps == [5, 6, 7]
+    assert values == pytest.approx([50.0, 60.0, 70.0])
+
+
+def test_rtc_smooth_single_overlap_blends_half_old_half_new(robot_client):
+    robot_client.config.aggregate_fn_name = "rtc_smooth"
+    robot_client.config.rtc_smooth_safe_prefix_steps = 0
+    robot_client.config.rtc_smooth_blend_steps = 1
+    robot_client.config.rtc_smooth_exp_schedule = False
+    robot_client.latest_action = 4
+
+    robot_client.action_queue.put(_make_constant_actions(start_ts=100.0, start_t=5, values=[0])[0])
+    incoming = _make_constant_actions(start_ts=101.0, start_t=5, values=[10])
+
+    robot_client._aggregate_action_queues(incoming, receive_time=100.5)
+
+    timesteps, values = _queue_timesteps_and_values(robot_client.action_queue)
+    assert timesteps == [5]
+    assert values == pytest.approx([5.0])
 
 
 @pytest.mark.parametrize(
