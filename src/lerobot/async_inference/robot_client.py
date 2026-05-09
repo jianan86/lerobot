@@ -40,9 +40,9 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pprint import pformat
-from queue import Queue
+from queue import Empty, Full, Queue
 from typing import Any
 
 import draccus
@@ -84,6 +84,18 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+
+
+@dataclass(frozen=True)
+class ObservationRequest:
+    task: str
+    verbose: bool
+    request_id: int
+    latest_action: int
+    current_queue_size: int
+    queue_ratio: float
+    action_chunk_size: int
+    must_go: bool
 
 
 class RobotClient:
@@ -153,6 +165,12 @@ class RobotClient:
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
 
+        self._observation_request_queue: Queue[ObservationRequest | None] | None = (
+            Queue(maxsize=1) if config.async_observation else None
+        )
+        self._observation_worker_thread: threading.Thread | None = None
+        self._observation_worker_busy = threading.Event()
+
     def _pose_act_piper_lerobot_features(self) -> dict[str, dict]:
         """Feature contract for pose_act: pose7d state plus the robot cameras."""
         features = {
@@ -198,6 +216,7 @@ class RobotClient:
             self.stub.SendPolicyInstructions(policy_setup)
 
             self.shutdown_event.clear()
+            self._start_observation_worker()
 
             return True
 
@@ -208,6 +227,7 @@ class RobotClient:
     def stop(self):
         """Stop the robot client"""
         self.shutdown_event.set()
+        self._stop_observation_worker()
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -248,6 +268,111 @@ class RobotClient:
         except grpc.RpcError as e:
             self.logger.error(f"Error sending observation #{obs.get_timestep()}: {e}")
             return False
+
+    def _start_observation_worker(self) -> None:
+        if self._observation_request_queue is None:
+            return
+        if self._observation_worker_thread is not None and self._observation_worker_thread.is_alive():
+            return
+
+        self._observation_worker_thread = threading.Thread(
+            target=self._observation_worker_loop,
+            name="observation-sender",
+            daemon=True,
+        )
+        self._observation_worker_thread.start()
+
+    def _stop_observation_worker(self) -> None:
+        if self._observation_request_queue is None:
+            return
+        try:
+            self._observation_request_queue.put_nowait(None)
+        except Full:
+            pass
+        if self._observation_worker_thread is not None:
+            self._observation_worker_thread.join(timeout=2.0)
+            if self._observation_worker_thread.is_alive():
+                self.logger.warning("Observation worker did not stop cleanly")
+
+    def _observation_worker_loop(self) -> None:
+        assert self._observation_request_queue is not None
+        while self.running:
+            try:
+                request = self._observation_request_queue.get(timeout=0.1)
+            except Empty:
+                continue
+
+            if request is None:
+                self._observation_request_queue.task_done()
+                return
+
+            self._observation_worker_busy.set()
+            try:
+                self._send_observation_request(request)
+            finally:
+                self._observation_worker_busy.clear()
+                self._observation_request_queue.task_done()
+
+    def _warn_observation_schedule_skipped(self, request: ObservationRequest, reason: str) -> None:
+        msg = (
+            "Skipping async observation request "
+            f"request_id={request.request_id} reason={reason} latest_action={request.latest_action} "
+            f"queue_size={request.current_queue_size} must_go={request.must_go}"
+        )
+        if request.must_go:
+            msg += "; must_go observation was not submitted and will be retried"
+        self.logger.warning(msg)
+        if self._diagnostics.enabled:
+            self._diagnostics.write_async_loop_event(
+                "client_observation_schedule_skipped",
+                request_id=int(request.request_id),
+                reason=reason,
+                latest_action=int(request.latest_action),
+                queue_size=int(request.current_queue_size),
+                queue_ratio=float(request.queue_ratio),
+                action_chunk_size=int(request.action_chunk_size),
+                must_go=bool(request.must_go),
+            )
+
+    def _make_observation_request(self, task: str, verbose: bool) -> ObservationRequest:
+        with self.latest_action_lock:
+            latest_action = self.latest_action
+
+        with self.action_queue_lock:
+            current_queue_size = self.action_queue.qsize()
+            must_go = self.must_go.is_set() and self.action_queue.empty()
+
+        queue_ratio = current_queue_size / max(1, self.action_chunk_size)
+        request_id = self._async_loop_request_id
+        self._async_loop_request_id += 1
+
+        return ObservationRequest(
+            task=task,
+            verbose=verbose,
+            request_id=request_id,
+            latest_action=latest_action,
+            current_queue_size=current_queue_size,
+            queue_ratio=queue_ratio,
+            action_chunk_size=self.action_chunk_size,
+            must_go=must_go,
+        )
+
+    def _schedule_observation(self, task: str, verbose: bool = False) -> bool:
+        if self._observation_request_queue is None:
+            raise RuntimeError("async_observation is not enabled")
+
+        request = self._make_observation_request(task, verbose)
+        if self._observation_worker_busy.is_set():
+            self._warn_observation_schedule_skipped(request, "worker_busy")
+            return False
+
+        try:
+            self._observation_request_queue.put_nowait(request)
+        except Full:
+            self._warn_observation_schedule_skipped(request, "queue_full")
+            return False
+
+        return True
 
     def _inspect_action_queue(self):
         with self.action_queue_lock:
@@ -701,64 +826,55 @@ class RobotClient:
 
         return observation
 
-    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+    def _send_observation_request(self, request: ObservationRequest) -> RawObservation | None:
         try:
-            # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
             if self._pose_act_adapter is not None:
-                raw_observation = self._build_pose_act_history_observation(task)
+                raw_observation = self._build_pose_act_history_observation(request.task)
             else:
                 raw_observation = self.robot.get_observation()
-                raw_observation["task"] = task
-
-            with self.latest_action_lock:
-                latest_action = self.latest_action
+                raw_observation["task"] = request.task
 
             observation = TimedObservation(
-                timestamp=time.time(),  # need time.time() to compare timestamps across client and server
+                timestamp=time.time(),
                 observation=raw_observation,
-                timestep=max(latest_action, 0),
+                timestep=max(request.latest_action, 0),
+                must_go=request.must_go,
             )
 
             obs_capture_time = time.perf_counter() - start_time
+            raw_observation["async_loop_request_id"] = request.request_id
 
-            # If there are no actions left in the queue, the observation must go through processing!
-            with self.action_queue_lock:
-                observation.must_go = self.must_go.is_set() and self.action_queue.empty()
-                current_queue_size = self.action_queue.qsize()
-            queue_ratio = current_queue_size / max(1, self.action_chunk_size)
-            request_id = self._async_loop_request_id
-            self._async_loop_request_id += 1
-            raw_observation["async_loop_request_id"] = request_id
-
-            _ = self.send_observation(observation)
+            sent = self.send_observation(observation)
             if self._diagnostics.enabled:
                 self._diagnostics.write_async_loop_event(
                     "client_request_sent",
-                    request_id=int(request_id),
+                    request_id=int(request.request_id),
                     send_wallclock=float(observation.get_timestamp()),
                     observation_timestep=int(observation.get_timestep()),
-                    latest_action_at_send=int(latest_action),
-                    queue_size_at_send=int(current_queue_size),
-                    queue_ratio_at_send=float(queue_ratio),
-                    action_chunk_size=int(self.action_chunk_size),
+                    latest_action_at_send=int(request.latest_action),
+                    queue_size_at_send=int(request.current_queue_size),
+                    queue_ratio_at_send=float(request.queue_ratio),
+                    action_chunk_size=int(request.action_chunk_size),
                     chunk_size_threshold=float(self._chunk_size_threshold),
                     must_go=bool(observation.must_go),
                     obs_capture_ms=float(obs_capture_time * 1000),
                     fps=float(self.config.fps),
                     actions_per_chunk=int(self.config.actions_per_chunk),
+                    async_observation=bool(self.config.async_observation),
+                    sent=bool(sent),
                 )
 
-            self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
-            if observation.must_go:
+            self.logger.debug(
+                f"QUEUE SIZE: {request.current_queue_size} (Must go: {observation.must_go})"
+            )
+            if sent and observation.must_go:
                 # must-go event will be set again after receiving actions
                 self.must_go.clear()
 
-            if verbose:
-                # Calculate comprehensive FPS metrics
+            if request.verbose:
                 fps_metrics = self.fps_tracker.calculate_fps_metrics(observation.get_timestamp())
-
                 self.logger.info(
                     f"Obs #{observation.get_timestep()} | "
                     f"Avg FPS: {fps_metrics['avg_fps']:.2f} | "
@@ -773,6 +889,10 @@ class RobotClient:
 
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
+            return None
+
+    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+        return self._send_observation_request(self._make_observation_request(task, verbose))
 
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
@@ -799,7 +919,10 @@ class RobotClient:
 
             """Control loop: (2) Streaming observations to the remote policy server"""
             if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+                if self.config.async_observation:
+                    self._schedule_observation(task, verbose)
+                else:
+                    _captured_observation = self.control_loop_observation(task, verbose)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency

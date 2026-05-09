@@ -146,7 +146,7 @@ class _StubPoseActPiperRobot:
         return obs
 
 
-def _make_pose_act_piper_client(monkeypatch):
+def _make_pose_act_piper_client(monkeypatch, async_observation: bool = False):
     from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.async_inference.robot_client import RobotClient
     from lerobot.robots.piper_follower import PiperFollowerConfig
@@ -163,6 +163,7 @@ def _make_pose_act_piper_client(monkeypatch):
             policy_type="pose_act",
             pretrained_name_or_path="test",
             actions_per_chunk=3,
+            async_observation=async_observation,
         )
     )
 
@@ -269,6 +270,22 @@ def test_robot_client_config_accepts_rtc_smooth_aggregate_fn():
     )
 
     assert cfg.aggregate_fn is None
+
+
+def test_robot_client_config_to_dict_includes_async_observation():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        async_observation=True,
+    )
+
+    assert cfg.to_dict()["async_observation"] is True
 
 
 def test_robot_client_config_rejects_invalid_aggregate_fn():
@@ -502,6 +519,62 @@ def test_pose_act_piper_client_sends_previous_and_current_frames(monkeypatch):
     assert second_obs[OBS_STATE][1, 0] > second_obs[OBS_STATE][0, 0]
     image_key = next(key for key in second_obs if key.startswith(f"{OBS_IMAGES}."))
     assert second_obs[image_key].shape[0] == 2
+
+
+def test_async_observation_skips_busy_worker_with_warning_and_keeps_must_go(monkeypatch, caplog):
+    client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
+    client.must_go.set()
+    client._observation_worker_busy.set()
+
+    try:
+        with caplog.at_level("WARNING"):
+            scheduled = client._schedule_observation(task="test")
+    finally:
+        client._observation_worker_busy.clear()
+        client.stop()
+
+    assert scheduled is False
+    assert client.must_go.is_set()
+    assert "Skipping async observation request" in caplog.text
+    assert "reason=worker_busy" in caplog.text
+    assert "must_go observation was not submitted and will be retried" in caplog.text
+
+
+def test_async_observation_skips_full_queue_with_warning_and_keeps_must_go(monkeypatch, caplog):
+    client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
+    client.must_go.set()
+    assert client._observation_request_queue is not None
+    client._observation_request_queue.put_nowait(client._make_observation_request("first", False))
+
+    try:
+        with caplog.at_level("WARNING"):
+            scheduled = client._schedule_observation(task="test")
+    finally:
+        client.stop()
+
+    assert scheduled is False
+    assert client.must_go.is_set()
+    assert "Skipping async observation request" in caplog.text
+    assert "reason=queue_full" in caplog.text
+
+
+def test_async_observation_clears_must_go_only_after_successful_send(monkeypatch):
+    client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
+    sent = []
+
+    try:
+        client.must_go.set()
+        monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or False)
+        client._send_observation_request(client._make_observation_request("test", False))
+        assert client.must_go.is_set()
+        assert sent[-1].must_go is True
+
+        monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or True)
+        client._send_observation_request(client._make_observation_request("test", False))
+        assert not client.must_go.is_set()
+        assert sent[-1].must_go is True
+    finally:
+        client.stop()
 
 
 def test_pose_act_piper_client_handles_pose7d_response(monkeypatch):
