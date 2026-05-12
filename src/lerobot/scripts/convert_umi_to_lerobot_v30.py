@@ -56,6 +56,7 @@ DEFAULT_REPO_ID = "local/umi-0421-v30"
 DEFAULT_TASK = "umi episode"
 DEFAULT_CAMERAS = ("fisheye_rgb",)
 CAMERA_STORAGE_CHOICES = ("image", "video")
+PIKA_POSE_SMOOTHING_MODE_CHOICES = ("causal", "zero_phase")
 
 DEPTH_CAMERA_DIR = Path("camera/color/pikaDepthCamera")
 FISHEYE_CAMERA_DIR = Path("camera/color/pikaFisheyeCamera")
@@ -81,7 +82,7 @@ RGB_CAMERA_FEATURES = {
 }
 DEPTH_CAMERA = "depth_camera"
 DEPTH_CAMERA_FEATURE = "observation.depth.depth_camera"
-SUPPORTED_CAMERAS = tuple([*RGB_CAMERA_DIRS, DEPTH_CAMERA])
+SUPPORTED_CAMERAS = (*RGB_CAMERA_DIRS, DEPTH_CAMERA)
 
 
 def load_synced_files(directory: Path) -> list[Path]:
@@ -150,10 +151,99 @@ def euler_xyz_to_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.nd
     return matrix.astype(np.float32, copy=False)
 
 
+def rotation_matrix_to_euler_xyz(rot_mat: np.ndarray) -> np.ndarray:
+    if rot_mat.shape != (3, 3):
+        raise ValueError(f"Expected a 3x3 rotation matrix, got shape {rot_mat.shape}")
+
+    pitch = math.asin(float(np.clip(rot_mat[0, 2], -1.0, 1.0)))
+    cos_pitch = math.cos(pitch)
+    if abs(cos_pitch) > 1e-6:
+        roll = math.atan2(float(-rot_mat[1, 2]), float(rot_mat[2, 2]))
+        yaw = math.atan2(float(-rot_mat[0, 1]), float(rot_mat[0, 0]))
+    else:
+        yaw = 0.0
+        if pitch > 0.0:
+            roll = math.atan2(float(rot_mat[1, 0]), float(-rot_mat[2, 0]))
+        else:
+            roll = math.atan2(float(-rot_mat[1, 0]), float(rot_mat[2, 0]))
+
+    return np.asarray([roll, pitch, yaw], dtype=np.float32)
+
+
 def rotation_matrix_to_rot6d(rot_mat: np.ndarray) -> np.ndarray:
     if rot_mat.shape != (3, 3):
         raise ValueError(f"Expected a 3x3 rotation matrix, got shape {rot_mat.shape}")
     return np.concatenate((rot_mat[:, 0], rot_mat[:, 1]), axis=0).astype(np.float32, copy=False)
+
+
+def validate_smoothing_alpha(alpha: float) -> float:
+    alpha = float(alpha)
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"smooth_pika_pose_alpha must satisfy 0.0 < alpha <= 1.0, got {alpha}")
+    return alpha
+
+
+def validate_pika_pose_smoothing_mode(mode: str) -> str:
+    if mode not in PIKA_POSE_SMOOTHING_MODE_CHOICES:
+        raise ValueError(
+            f"smooth_pika_pose_mode must be one of {PIKA_POSE_SMOOTHING_MODE_CHOICES}, got {mode!r}"
+        )
+    return mode
+
+
+def _require_scipy_rotation() -> tuple[Any, Any]:
+    try:
+        from scipy.spatial.transform import Rotation, Slerp
+    except ImportError as exc:
+        raise ImportError(
+            "Pika pose smoothing requires scipy. Install the existing extra with "
+            "`uv sync --locked --extra scipy-dep --extra matplotlib-dep`."
+        ) from exc
+    return Rotation, Slerp
+
+
+def _smooth_pika_pose_state_sequence_causal(
+    states: np.ndarray,
+    alpha: float,
+    rotation_cls: Any,
+    slerp_cls: Any,
+) -> np.ndarray:
+    smoothed = states.astype(np.float32, copy=True)
+    previous_rotation = rotation_cls.from_matrix(euler_xyz_to_rotation_matrix(*states[0, 3:6]))
+
+    for idx in range(1, len(states)):
+        smoothed[idx, :3] = alpha * states[idx, :3] + (1.0 - alpha) * smoothed[idx - 1, :3]
+
+        current_rotation = rotation_cls.from_matrix(euler_xyz_to_rotation_matrix(*states[idx, 3:6]))
+        slerp = slerp_cls([0.0, 1.0], rotation_cls.concatenate([previous_rotation, current_rotation]))
+        previous_rotation = slerp([alpha])[0]
+        smoothed[idx, 3:6] = rotation_matrix_to_euler_xyz(
+            previous_rotation.as_matrix().astype(np.float32, copy=False)
+        )
+
+    smoothed[:, 6] = states[:, 6]
+    return smoothed.astype(np.float32, copy=False)
+
+
+def smooth_pika_pose_state_sequence(
+    states: np.ndarray,
+    alpha: float = 0.25,
+    mode: str = "causal",
+) -> np.ndarray:
+    alpha = validate_smoothing_alpha(alpha)
+    mode = validate_pika_pose_smoothing_mode(mode)
+    states = np.asarray(states, dtype=np.float32)
+    if states.ndim != 2 or states.shape[1] != 7:
+        raise ValueError(f"Expected states to have shape (num_frames, 7), got {states.shape}")
+    if len(states) == 0:
+        return states.astype(np.float32, copy=True)
+
+    rotation_cls, slerp_cls = _require_scipy_rotation()
+    smoothed = _smooth_pika_pose_state_sequence_causal(states, alpha, rotation_cls, slerp_cls)
+    if mode == "zero_phase":
+        smoothed = _smooth_pika_pose_state_sequence_causal(smoothed[::-1], alpha, rotation_cls, slerp_cls)[::-1]
+        smoothed[:, 6] = states[:, 6]
+    return smoothed.astype(np.float32, copy=False)
 
 
 def load_rgb_image(path: Path) -> np.ndarray:
@@ -365,6 +455,9 @@ def add_episode_to_dataset(
     cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
     camera_storage: str = "image",
     frame_range: tuple[float, float] | list[float] | None = None,
+    smooth_pika_pose: bool = False,
+    smooth_pika_pose_alpha: float = 0.25,
+    smooth_pika_pose_mode: str = "causal",
 ) -> dict[str, Any]:
     input_episode = Path(input_episode)
     selected_cameras = parse_cameras(cameras)
@@ -383,8 +476,26 @@ def add_episode_to_dataset(
     logging.info("Using aligned frame count: %s", aligned_length)
     logging.info("Using source frame range: [%s, %s)", source_frame_start, source_frame_end)
 
-    for frame_idx in range(source_frame_start, source_frame_end):
-        state = build_state_vector(modality_files["pose"][frame_idx], modality_files["gripper"][frame_idx])
+    states = np.stack(
+        [
+            build_state_vector(modality_files["pose"][frame_idx], modality_files["gripper"][frame_idx])
+            for frame_idx in range(source_frame_start, source_frame_end)
+        ]
+    )
+    if smooth_pika_pose:
+        logging.info(
+            "Smoothing Pika pose with alpha=%s, mode=%s",
+            smooth_pika_pose_alpha,
+            smooth_pika_pose_mode,
+        )
+        states = smooth_pika_pose_state_sequence(
+            states,
+            alpha=smooth_pika_pose_alpha,
+            mode=smooth_pika_pose_mode,
+        )
+
+    for state_idx, frame_idx in enumerate(range(source_frame_start, source_frame_end)):
+        state = states[state_idx]
         frame = {
             "task": task_text,
             "observation.state": state,
@@ -405,6 +516,9 @@ def add_episode_to_dataset(
         "task": task_text,
         "cameras": selected_cameras,
         "camera_storage": camera_storage,
+        "smooth_pika_pose": smooth_pika_pose,
+        "smooth_pika_pose_alpha": float(smooth_pika_pose_alpha),
+        "smooth_pika_pose_mode": smooth_pika_pose_mode,
     }
 
 
@@ -419,6 +533,9 @@ def convert_episode(
     cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
     camera_storage: str = "image",
     frame_range: tuple[float, float] | list[float] | None = None,
+    smooth_pika_pose: bool = False,
+    smooth_pika_pose_alpha: float = 0.25,
+    smooth_pika_pose_mode: str = "causal",
 ) -> dict[str, Any]:
     from lerobot.datasets import LeRobotDataset
 
@@ -454,6 +571,9 @@ def convert_episode(
             cameras=selected_cameras,
             camera_storage=camera_storage,
             frame_range=frame_range,
+            smooth_pika_pose=smooth_pika_pose,
+            smooth_pika_pose_alpha=smooth_pika_pose_alpha,
+            smooth_pika_pose_mode=smooth_pika_pose_mode,
         )
         dataset.finalize()
     except Exception:
@@ -492,6 +612,9 @@ def convert_episodes(
     cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
     camera_storage: str = "image",
     frame_range: tuple[float, float] | list[float] | None = None,
+    smooth_pika_pose: bool = False,
+    smooth_pika_pose_alpha: float = 0.25,
+    smooth_pika_pose_mode: str = "causal",
 ) -> dict[str, Any]:
     from lerobot.datasets import LeRobotDataset
 
@@ -532,6 +655,9 @@ def convert_episodes(
                     cameras=selected_cameras,
                     camera_storage=camera_storage,
                     frame_range=frame_range,
+                    smooth_pika_pose=smooth_pika_pose,
+                    smooth_pika_pose_alpha=smooth_pika_pose_alpha,
+                    smooth_pika_pose_mode=smooth_pika_pose_mode,
                 )
             )
         dataset.finalize()
@@ -548,6 +674,9 @@ def convert_episodes(
         "total_selected_frames": sum(item["selected_frames"] for item in episode_manifests),
         "cameras": selected_cameras,
         "camera_storage": camera_storage,
+        "smooth_pika_pose": smooth_pika_pose,
+        "smooth_pika_pose_alpha": float(smooth_pika_pose_alpha),
+        "smooth_pika_pose_mode": smooth_pika_pose_mode,
         "features": features,
         "episodes": episode_manifests,
     }
@@ -603,6 +732,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Deprecated alias for --camera-storage video.",
     )
+    parser.add_argument(
+        "--smooth-pika-pose",
+        action="store_true",
+        help="Smooth localization/pose/pika with position EMA and quaternion Slerp rotation smoothing.",
+    )
+    parser.add_argument(
+        "--smooth-pika-pose-alpha",
+        type=float,
+        default=0.25,
+        help="Smoothing factor for --smooth-pika-pose. Must satisfy 0.0 < alpha <= 1.0.",
+    )
+    parser.add_argument(
+        "--smooth-pika-pose-mode",
+        choices=PIKA_POSE_SMOOTHING_MODE_CHOICES,
+        default="causal",
+        help="Use causal online-style smoothing or offline forward-backward zero_phase smoothing.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output dataset root.")
     return parser
 
@@ -621,6 +767,9 @@ def main() -> None:
         cameras=args.cameras,
         camera_storage=args.camera_storage,
         frame_range=args.frame_range,
+        smooth_pika_pose=args.smooth_pika_pose,
+        smooth_pika_pose_alpha=args.smooth_pika_pose_alpha,
+        smooth_pika_pose_mode=args.smooth_pika_pose_mode,
     )
     print(json.dumps(manifest, indent=2))
 

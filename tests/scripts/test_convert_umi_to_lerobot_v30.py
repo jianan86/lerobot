@@ -14,10 +14,13 @@ from lerobot.scripts.convert_umi_to_lerobot_v30 import (
     convert_episodes,
     discover_episode_dirs,
     discover_episode_files,
+    euler_xyz_to_rotation_matrix,
     get_episode_task,
     infer_features,
     load_synced_files,
     resolve_frame_slice,
+    rotation_matrix_to_euler_xyz,
+    smooth_pika_pose_state_sequence,
 )
 
 try:
@@ -26,6 +29,20 @@ try:
     DATASETS_AVAILABLE = True
 except ImportError:
     DATASETS_AVAILABLE = False
+
+try:
+    import scipy  # noqa: F401
+
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+try:
+    import matplotlib  # noqa: F401
+
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -201,6 +218,77 @@ def test_build_state_vector_uses_raw_xyz_euler_and_gripper_width(tmp_path):
     np.testing.assert_allclose(state, np.array([0.1, 0.2, 0.3, 0.0, 0.0, np.pi / 2, 0.4], dtype=np.float32))
 
 
+def test_smooth_pika_pose_rejects_invalid_alpha():
+    states = np.zeros((2, 7), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="smooth_pika_pose_alpha"):
+        smooth_pika_pose_state_sequence(states, alpha=0.0)
+
+
+def test_smooth_pika_pose_rejects_invalid_mode():
+    states = np.zeros((2, 7), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="smooth_pika_pose_mode"):
+        smooth_pika_pose_state_sequence(states, mode="centered")
+
+
+@pytest.mark.skipif(not SCIPY_AVAILABLE, reason="scipy extra required")
+def test_smooth_pika_pose_uses_position_ema_rotation_slerp_and_raw_gripper():
+    states = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1],
+            [2.0, 4.0, 6.0, 0.0, 0.0, np.pi / 2, 0.2],
+            [4.0, 8.0, 12.0, 0.0, 0.0, np.pi / 2, 0.3],
+        ],
+        dtype=np.float32,
+    )
+
+    smoothed = smooth_pika_pose_state_sequence(states, alpha=0.5)
+
+    assert smoothed.dtype == np.float32
+    np.testing.assert_allclose(smoothed[0], states[0], atol=1e-6)
+    np.testing.assert_allclose(smoothed[:, :3], np.array([[0, 0, 0], [1, 2, 3], [2.5, 5, 7.5]]), atol=1e-6)
+    np.testing.assert_allclose(smoothed[:, 6], states[:, 6], atol=1e-6)
+    np.testing.assert_allclose(smoothed[1, 3:6], np.array([0.0, 0.0, np.pi / 4]), atol=1e-5)
+    np.testing.assert_allclose(smoothed[2, 3:6], np.array([0.0, 0.0, 3 * np.pi / 8]), atol=1e-5)
+
+    for euler in smoothed[:, 3:6]:
+        rot_mat = euler_xyz_to_rotation_matrix(*euler)
+        np.testing.assert_allclose(rot_mat.T @ rot_mat, np.eye(3), atol=1e-5)
+
+
+@pytest.mark.skipif(not SCIPY_AVAILABLE, reason="scipy extra required")
+def test_smooth_pika_pose_zero_phase_uses_future_frames():
+    states = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1],
+            [2.0, 4.0, 6.0, 0.0, 0.0, np.pi / 2, 0.2],
+            [4.0, 8.0, 12.0, 0.0, 0.0, np.pi / 2, 0.3],
+        ],
+        dtype=np.float32,
+    )
+
+    smoothed = smooth_pika_pose_state_sequence(states, alpha=0.5, mode="zero_phase")
+
+    np.testing.assert_allclose(
+        smoothed[:, :3],
+        np.array([[0.875, 1.75, 2.625], [1.75, 3.5, 5.25], [2.5, 5.0, 7.5]]),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(smoothed[:, 6], states[:, 6], atol=1e-6)
+    np.testing.assert_allclose(smoothed[0, 3:6], np.array([0.0, 0.0, 5 * np.pi / 32]), atol=1e-5)
+    np.testing.assert_allclose(smoothed[1, 3:6], np.array([0.0, 0.0, 5 * np.pi / 16]), atol=1e-5)
+    np.testing.assert_allclose(smoothed[2, 3:6], np.array([0.0, 0.0, 3 * np.pi / 8]), atol=1e-5)
+
+
+def test_rotation_matrix_to_euler_xyz_roundtrip():
+    euler = np.array([0.2, -0.3, 0.4], dtype=np.float32)
+
+    restored = rotation_matrix_to_euler_xyz(euler_xyz_to_rotation_matrix(*euler))
+
+    np.testing.assert_allclose(restored, euler, atol=1e-6)
+
+
 @pytest.mark.skipif(not DATASETS_AVAILABLE, reason="datasets extra required")
 def test_convert_episode_writes_local_lerobot_dataset(tmp_path):
     from lerobot.datasets import LeRobotDataset
@@ -256,6 +344,36 @@ def test_convert_episode_writes_fractional_frame_range(tmp_path):
     )
     assert dataset[0]["frame_index"].item() == 0
     assert dataset[5]["frame_index"].item() == 5
+
+
+@pytest.mark.skipif(not DATASETS_AVAILABLE, reason="datasets extra required")
+@pytest.mark.skipif(not SCIPY_AVAILABLE, reason="scipy extra required")
+def test_convert_episode_writes_smoothed_pika_pose(tmp_path):
+    from lerobot.datasets import LeRobotDataset
+
+    episode = _make_episode(tmp_path, frames=3)
+    output_root = tmp_path / "output"
+
+    manifest = convert_episode(
+        episode,
+        output_root,
+        repo_id="local/test-umi-smoothed",
+        fps=30,
+        cameras="none",
+        smooth_pika_pose=True,
+        smooth_pika_pose_alpha=0.5,
+        smooth_pika_pose_mode="zero_phase",
+    )
+    dataset = LeRobotDataset("local/test-umi-smoothed", root=output_root)
+
+    assert manifest["smooth_pika_pose"] is True
+    assert manifest["smooth_pika_pose_alpha"] == 0.5
+    assert manifest["smooth_pika_pose_mode"] == "zero_phase"
+    np.testing.assert_allclose(dataset[0]["observation.state"][:3], np.array([0.4375, 1.4375, 2.4375]), atol=1e-6)
+    np.testing.assert_allclose(dataset[1]["observation.state"][:3], np.array([0.875, 1.875, 2.875]), atol=1e-6)
+    np.testing.assert_allclose(dataset[2]["observation.state"][:3], np.array([1.25, 2.25, 3.25]), atol=1e-6)
+    np.testing.assert_allclose(dataset[2]["observation.state"][6], 2.2, atol=1e-6)
+    np.testing.assert_allclose(dataset[2]["action"], dataset[2]["observation.state"], atol=1e-6)
 
 
 @pytest.mark.skipif(not DATASETS_AVAILABLE, reason="datasets extra required")
@@ -315,3 +433,48 @@ def test_discover_episode_files_finds_expected_modalities(tmp_path):
 
     assert set(files) == {"depth_camera_rgb", "fisheye_rgb", "depth_camera", "pose", "gripper"}
     assert all(len(paths) == 2 for paths in files.values())
+
+
+@pytest.mark.skipif(not SCIPY_AVAILABLE, reason="scipy extra required")
+@pytest.mark.skipif(not MATPLOTLIB_AVAILABLE, reason="matplotlib extra required")
+def test_visualize_0429_episode94_pika_pose_smoothing():
+    data_episode = Path("/home/jianan/workspace/data/0429/episode94")
+    if not data_episode.exists():
+        pytest.skip(f"Local validation data not found: {data_episode}")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    files = discover_episode_files(data_episode, cameras="none")
+    raw_states = np.stack(
+        [
+            build_state_vector(pose_path, gripper_path)
+            for pose_path, gripper_path in zip(files["pose"], files["gripper"], strict=True)
+        ]
+    )
+    smoothed_states = smooth_pika_pose_state_sequence(raw_states, alpha=0.5, mode="zero_phase")
+
+    assert raw_states.shape == smoothed_states.shape == (162, 7)
+    assert smoothed_states.dtype == np.float32
+    np.testing.assert_allclose(smoothed_states[:, 6], raw_states[:, 6], atol=1e-6)
+
+    output_dir = Path("outputs/umi_pose_smoothing")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "episode94_pose_smoothing.png"
+
+    frame_idx = np.arange(len(raw_states))
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7), sharex=True)
+    for axis, name, col in zip(axes.flat, ["x", "y", "z", "roll", "pitch", "yaw"], range(6), strict=True):
+        axis.plot(frame_idx, raw_states[:, col], label="raw", linewidth=1.0)
+        axis.plot(frame_idx, smoothed_states[:, col], label="smoothed", linewidth=1.0)
+        axis.set_title(name)
+        axis.grid(True, alpha=0.3)
+    axes[0, 0].legend()
+    fig.suptitle("0429 episode94 Pika pose smoothing, zero_phase alpha=0.5")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+    assert output_path.is_file()
