@@ -521,7 +521,41 @@ def test_pose_act_piper_client_sends_previous_and_current_frames(monkeypatch):
     assert second_obs[image_key].shape[0] == 2
 
 
-def test_async_observation_skips_busy_worker_with_warning_and_keeps_must_go(monkeypatch, caplog):
+def test_async_observation_skips_busy_worker_without_warning_for_non_must_go(monkeypatch, caplog):
+    client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
+    client.must_go.clear()
+    client._observation_worker_busy.set()
+
+    try:
+        with caplog.at_level("WARNING"):
+            scheduled = client._schedule_observation(task="test")
+    finally:
+        client._observation_worker_busy.clear()
+        client.stop()
+
+    assert scheduled is False
+    assert not client.must_go.is_set()
+    assert "Skipping async observation request" not in caplog.text
+
+
+def test_async_observation_skips_full_queue_without_warning_for_non_must_go(monkeypatch, caplog):
+    client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
+    client.must_go.clear()
+    assert client._observation_request_queue is not None
+    client._observation_request_queue.put_nowait(client._make_observation_request("first", False))
+
+    try:
+        with caplog.at_level("WARNING"):
+            scheduled = client._schedule_observation(task="test")
+    finally:
+        client.stop()
+
+    assert scheduled is False
+    assert not client.must_go.is_set()
+    assert "Skipping async observation request" not in caplog.text
+
+
+def test_async_observation_skips_must_go_with_warning_and_keeps_must_go(monkeypatch, caplog):
     client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
     client.must_go.set()
     client._observation_worker_busy.set()
@@ -540,39 +574,28 @@ def test_async_observation_skips_busy_worker_with_warning_and_keeps_must_go(monk
     assert "must_go observation was not submitted and will be retried" in caplog.text
 
 
-def test_async_observation_skips_full_queue_with_warning_and_keeps_must_go(monkeypatch, caplog):
-    client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
-    client.must_go.set()
-    assert client._observation_request_queue is not None
-    client._observation_request_queue.put_nowait(client._make_observation_request("first", False))
-
-    try:
-        with caplog.at_level("WARNING"):
-            scheduled = client._schedule_observation(task="test")
-    finally:
-        client.stop()
-
-    assert scheduled is False
-    assert client.must_go.is_set()
-    assert "Skipping async observation request" in caplog.text
-    assert "reason=queue_full" in caplog.text
-
-
-def test_async_observation_clears_must_go_only_after_successful_send(monkeypatch):
+def test_async_observation_clears_must_go_only_after_successful_send(monkeypatch, caplog):
     client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
     sent = []
 
     try:
         client.must_go.set()
         monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or False)
-        client._send_observation_request(client._make_observation_request("test", False))
+        with caplog.at_level("INFO"):
+            client._send_observation_request(client._make_observation_request("test", False))
         assert client.must_go.is_set()
         assert sent[-1].must_go is True
+        assert "Sent async observation request" not in caplog.text
 
         monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or True)
-        client._send_observation_request(client._make_observation_request("test", False))
+        with caplog.at_level("INFO"):
+            client._send_observation_request(client._make_observation_request("test", False))
         assert not client.must_go.is_set()
         assert sent[-1].must_go is True
+        assert "Sent async observation request" in caplog.text
+        assert "request_id=" in caplog.text
+        assert "queue_size=" in caplog.text
+        assert "action_chunk_size=" in caplog.text
     finally:
         client.stop()
 

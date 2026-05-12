@@ -314,14 +314,13 @@ class RobotClient:
                 self._observation_request_queue.task_done()
 
     def _warn_observation_schedule_skipped(self, request: ObservationRequest, reason: str) -> None:
-        msg = (
-            "Skipping async observation request "
-            f"request_id={request.request_id} reason={reason} latest_action={request.latest_action} "
-            f"queue_size={request.current_queue_size} must_go={request.must_go}"
-        )
         if request.must_go:
-            msg += "; must_go observation was not submitted and will be retried"
-        self.logger.warning(msg)
+            self.logger.warning(
+                "Skipping async observation request "
+                f"request_id={request.request_id} reason={reason} latest_action={request.latest_action} "
+                f"queue_size={request.current_queue_size} must_go={request.must_go}; "
+                "must_go observation was not submitted and will be retried"
+            )
         if self._diagnostics.enabled:
             self._diagnostics.write_async_loop_event(
                 "client_observation_schedule_skipped",
@@ -847,6 +846,15 @@ class RobotClient:
             raw_observation["async_loop_request_id"] = request.request_id
 
             sent = self.send_observation(observation)
+            if sent:
+                self.logger.info(
+                    "Sent async observation request "
+                    f"request_id={request.request_id} observation_timestep={observation.get_timestep()} "
+                    f"latest_action={request.latest_action} queue_size={request.current_queue_size} "
+                    f"queue_ratio={request.queue_ratio:.3f} action_chunk_size={request.action_chunk_size} "
+                    f"chunk_size_threshold={self._chunk_size_threshold:.3f} must_go={observation.must_go} "
+                    f"obs_capture_ms={obs_capture_time * 1000:.2f}"
+                )
             if self._diagnostics.enabled:
                 self._diagnostics.write_async_loop_event(
                     "client_request_sent",
