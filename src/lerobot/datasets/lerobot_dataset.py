@@ -62,6 +62,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        streaming_drop_frames: bool = True,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -187,6 +188,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encoder_threads (int | None, optional): Number of threads per encoder instance. None lets the
                 codec auto-detect (default). Lower values reduce CPU usage per encoder. Maps to 'lp' (via svtav1-params) for
                 libsvtav1 and 'threads' for h264/hevc.
+            streaming_drop_frames (bool, optional): If True, drop frames when a streaming encoder queue
+                is full. If False, block until the frame can be queued. Defaults to True.
 
         Note:
             Write-mode parameters (``streaming_encoding``, ``batch_encoding_size``) passed to
@@ -251,7 +254,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
             streaming_enc = None
             if streaming_encoding and len(self.meta.video_keys) > 0:
                 streaming_enc = self._build_streaming_encoder(
-                    self.meta.fps, self._vcodec, encoder_queue_maxsize, encoder_threads
+                    self.meta.fps,
+                    self._vcodec,
+                    encoder_queue_maxsize,
+                    encoder_threads,
+                    streaming_drop_frames,
                 )
             self.writer = DatasetWriter(
                 meta=self.meta,
@@ -301,6 +308,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         vcodec: str,
         encoder_queue_maxsize: int,
         encoder_threads: int | None,
+        streaming_drop_frames: bool = True,
     ) -> StreamingVideoEncoder:
         return StreamingVideoEncoder(
             fps=fps,
@@ -311,6 +319,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             preset=None,
             queue_maxsize=encoder_queue_maxsize,
             encoder_threads=encoder_threads,
+            drop_frames=streaming_drop_frames,
         )
 
     # ── Metadata properties ───────────────────────────────────────────
@@ -630,6 +639,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        streaming_drop_frames: bool = True,
     ) -> "LeRobotDataset":
         """Create a new LeRobotDataset from scratch for recording data.
 
@@ -663,6 +673,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encoder_queue_maxsize: Max buffered frames per camera when using
                 streaming encoding.
             encoder_threads: Threads per encoder instance. ``None`` for auto.
+            streaming_drop_frames: If ``True``, drop frames when the streaming
+                encoder queue is full. If ``False``, block until queued.
 
         Returns:
             A new :class:`LeRobotDataset` in write mode.
@@ -698,7 +710,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Create writer
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
-            streaming_enc = cls._build_streaming_encoder(fps, vcodec, encoder_queue_maxsize, encoder_threads)
+            streaming_enc = cls._build_streaming_encoder(
+                fps,
+                vcodec,
+                encoder_queue_maxsize,
+                encoder_threads,
+                streaming_drop_frames,
+            )
         obj.writer = DatasetWriter(
             meta=obj.meta,
             root=obj.root,
@@ -731,6 +749,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        streaming_drop_frames: bool = True,
     ) -> "LeRobotDataset":
         """Resume recording on an existing dataset.
 
@@ -760,6 +779,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 capture.
             encoder_queue_maxsize: Max buffered frames per camera for streaming.
             encoder_threads: Threads per encoder instance. ``None`` for auto.
+            streaming_drop_frames: If ``True``, drop frames when the streaming
+                encoder queue is full. If ``False``, block until queued.
 
         Returns:
             A :class:`LeRobotDataset` in write mode, ready to append episodes.
@@ -801,7 +822,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(
-                obj.meta.fps, vcodec, encoder_queue_maxsize, encoder_threads
+                obj.meta.fps,
+                vcodec,
+                encoder_queue_maxsize,
+                encoder_threads,
+                streaming_drop_frames,
             )
         obj.writer = DatasetWriter(
             meta=obj.meta,

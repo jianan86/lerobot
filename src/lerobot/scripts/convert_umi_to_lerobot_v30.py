@@ -56,7 +56,24 @@ DEFAULT_REPO_ID = "local/umi-0421-v30"
 DEFAULT_TASK = "umi episode"
 DEFAULT_CAMERAS = ("fisheye_rgb",)
 CAMERA_STORAGE_CHOICES = ("image", "video")
+VIDEO_CODEC_CHOICES = (
+    "h264",
+    "hevc",
+    "libsvtav1",
+    "auto",
+    "h264_videotoolbox",
+    "hevc_videotoolbox",
+    "h264_nvenc",
+    "hevc_nvenc",
+    "h264_vaapi",
+    "h264_qsv",
+)
 PIKA_POSE_SMOOTHING_MODE_CHOICES = ("causal", "zero_phase")
+DEFAULT_VIDEO_CODEC = "h264"
+CONVERSION_IMAGE_WRITER_THREADS = 4
+CONVERSION_IMAGE_WRITER_PROCESSES = 0
+CONVERSION_ENCODER_QUEUE_MAXSIZE = 120
+CONVERSION_ENCODER_THREADS = 4
 
 DEPTH_CAMERA_DIR = Path("camera/color/pikaDepthCamera")
 FISHEYE_CAMERA_DIR = Path("camera/color/pikaFisheyeCamera")
@@ -372,6 +389,42 @@ def camera_features_use_video(features: dict[str, dict[str, Any]]) -> bool:
     return any(feature["dtype"] == "video" for feature in features.values())
 
 
+def conversion_uses_streaming_encoding(
+    features: dict[str, dict[str, Any]],
+    streaming_encoding: bool | None,
+) -> bool:
+    use_videos = camera_features_use_video(features)
+    if streaming_encoding is None:
+        return use_videos
+    return bool(streaming_encoding) and use_videos
+
+
+def create_conversion_dataset(
+    repo_id: str,
+    fps: int,
+    features: dict[str, dict[str, Any]],
+    output_root: Path,
+    vcodec: str = DEFAULT_VIDEO_CODEC,
+    streaming_encoding: bool | None = None,
+) -> Any:
+    from lerobot.datasets import LeRobotDataset
+
+    return LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=fps,
+        features=features,
+        root=output_root,
+        use_videos=camera_features_use_video(features),
+        image_writer_processes=CONVERSION_IMAGE_WRITER_PROCESSES,
+        image_writer_threads=CONVERSION_IMAGE_WRITER_THREADS,
+        vcodec=vcodec,
+        streaming_encoding=conversion_uses_streaming_encoding(features, streaming_encoding),
+        encoder_queue_maxsize=CONVERSION_ENCODER_QUEUE_MAXSIZE,
+        encoder_threads=CONVERSION_ENCODER_THREADS,
+        streaming_drop_frames=False,
+    )
+
+
 def add_camera_frame_data(
     frame: dict[str, Any],
     modality_files: dict[str, list[Path]],
@@ -536,9 +589,9 @@ def convert_episode(
     smooth_pika_pose: bool = False,
     smooth_pika_pose_alpha: float = 0.25,
     smooth_pika_pose_mode: str = "causal",
+    vcodec: str = DEFAULT_VIDEO_CODEC,
+    streaming_encoding: bool | None = None,
 ) -> dict[str, Any]:
-    from lerobot.datasets import LeRobotDataset
-
     input_episode = Path(input_episode)
     output_root = Path(output_root)
     selected_cameras = parse_cameras(cameras)
@@ -555,12 +608,13 @@ def convert_episode(
             )
         shutil.rmtree(output_root)
 
-    dataset = LeRobotDataset.create(
+    dataset = create_conversion_dataset(
         repo_id=repo_id,
         fps=fps,
         features=features,
-        root=output_root,
-        use_videos=camera_features_use_video(features),
+        output_root=output_root,
+        vcodec=vcodec,
+        streaming_encoding=streaming_encoding,
     )
 
     try:
@@ -586,6 +640,8 @@ def convert_episode(
         "output_root": str(output_root),
         "fps": fps,
         **episode_manifest,
+        "vcodec": vcodec,
+        "streaming_encoding": conversion_uses_streaming_encoding(features, streaming_encoding),
         "features": features,
     }
 
@@ -615,9 +671,9 @@ def convert_episodes(
     smooth_pika_pose: bool = False,
     smooth_pika_pose_alpha: float = 0.25,
     smooth_pika_pose_mode: str = "causal",
+    vcodec: str = DEFAULT_VIDEO_CODEC,
+    streaming_encoding: bool | None = None,
 ) -> dict[str, Any]:
-    from lerobot.datasets import LeRobotDataset
-
     input_root = Path(input_root)
     output_root = Path(output_root)
     selected_cameras = parse_cameras(cameras)
@@ -635,12 +691,13 @@ def convert_episodes(
             )
         shutil.rmtree(output_root)
 
-    dataset = LeRobotDataset.create(
+    dataset = create_conversion_dataset(
         repo_id=repo_id,
         fps=fps,
         features=features,
-        root=output_root,
-        use_videos=camera_features_use_video(features),
+        output_root=output_root,
+        vcodec=vcodec,
+        streaming_encoding=streaming_encoding,
     )
 
     episode_manifests: list[dict[str, Any]] = []
@@ -674,6 +731,8 @@ def convert_episodes(
         "total_selected_frames": sum(item["selected_frames"] for item in episode_manifests),
         "cameras": selected_cameras,
         "camera_storage": camera_storage,
+        "vcodec": vcodec,
+        "streaming_encoding": conversion_uses_streaming_encoding(features, streaming_encoding),
         "smooth_pika_pose": smooth_pika_pose,
         "smooth_pika_pose_alpha": float(smooth_pika_pose_alpha),
         "smooth_pika_pose_mode": smooth_pika_pose_mode,
@@ -728,6 +787,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Store RGB camera observations as parquet images or encoded videos. Depth stays a uint16 array.",
     )
     parser.add_argument(
+        "--vcodec",
+        choices=VIDEO_CODEC_CHOICES,
+        default=DEFAULT_VIDEO_CODEC,
+        help="Video codec for RGB camera video storage. Use 'auto' to prefer available hardware encoding.",
+    )
+    parser.add_argument(
+        "--no-streaming-encoding",
+        action="store_true",
+        help="Disable direct streaming video encoding and use the slower temporary-image encoding path.",
+    )
+    parser.add_argument(
         "--use-videos",
         action="store_true",
         help="Deprecated alias for --camera-storage video.",
@@ -770,6 +840,8 @@ def main() -> None:
         smooth_pika_pose=args.smooth_pika_pose,
         smooth_pika_pose_alpha=args.smooth_pika_pose_alpha,
         smooth_pika_pose_mode=args.smooth_pika_pose_mode,
+        vcodec=args.vcodec,
+        streaming_encoding=not args.no_streaming_encoding,
     )
     print(json.dumps(manifest, indent=2))
 

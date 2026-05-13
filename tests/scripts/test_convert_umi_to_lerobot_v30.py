@@ -10,6 +10,10 @@ from PIL import Image
 from lerobot.scripts.convert_umi_to_lerobot_v30 import (
     build_state_vector,
     compute_aligned_length,
+    CONVERSION_ENCODER_QUEUE_MAXSIZE,
+    CONVERSION_ENCODER_THREADS,
+    CONVERSION_IMAGE_WRITER_PROCESSES,
+    CONVERSION_IMAGE_WRITER_THREADS,
     convert_episode,
     convert_episodes,
     discover_episode_dirs,
@@ -43,6 +47,22 @@ try:
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
+
+
+class _FakeDataset:
+    def __init__(self) -> None:
+        self.frames = []
+        self.saved = False
+        self.finalized = False
+
+    def add_frame(self, frame: dict) -> None:
+        self.frames.append(frame)
+
+    def save_episode(self) -> None:
+        self.saved = True
+
+    def finalize(self) -> None:
+        self.finalized = True
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -287,6 +307,69 @@ def test_rotation_matrix_to_euler_xyz_roundtrip():
     restored = rotation_matrix_to_euler_xyz(euler_xyz_to_rotation_matrix(*euler))
 
     np.testing.assert_allclose(restored, euler, atol=1e-6)
+
+
+def test_convert_episode_uses_fast_video_defaults(tmp_path, monkeypatch):
+    import lerobot.datasets as datasets_module
+
+    episode = _make_episode(tmp_path, frames=2)
+    output_root = tmp_path / "output"
+    calls = []
+
+    def fake_create(**kwargs):
+        calls.append(kwargs)
+        return _FakeDataset()
+
+    monkeypatch.setattr(datasets_module.LeRobotDataset, "create", staticmethod(fake_create))
+
+    manifest = convert_episode(
+        episode,
+        output_root,
+        repo_id="local/test-umi-fast-video-defaults",
+        cameras="fisheye_rgb",
+        camera_storage="video",
+    )
+
+    assert manifest["streaming_encoding"] is True
+    assert manifest["vcodec"] == "h264"
+    assert calls[0]["use_videos"] is True
+    assert calls[0]["streaming_encoding"] is True
+    assert calls[0]["vcodec"] == "h264"
+    assert calls[0]["image_writer_processes"] == CONVERSION_IMAGE_WRITER_PROCESSES
+    assert calls[0]["image_writer_threads"] == CONVERSION_IMAGE_WRITER_THREADS
+    assert calls[0]["encoder_queue_maxsize"] == CONVERSION_ENCODER_QUEUE_MAXSIZE
+    assert calls[0]["encoder_threads"] == CONVERSION_ENCODER_THREADS
+    assert calls[0]["streaming_drop_frames"] is False
+
+
+def test_convert_episode_can_disable_streaming_encoding(tmp_path, monkeypatch):
+    import lerobot.datasets as datasets_module
+
+    episode = _make_episode(tmp_path, frames=2)
+    output_root = tmp_path / "output"
+    calls = []
+
+    def fake_create(**kwargs):
+        calls.append(kwargs)
+        return _FakeDataset()
+
+    monkeypatch.setattr(datasets_module.LeRobotDataset, "create", staticmethod(fake_create))
+
+    manifest = convert_episode(
+        episode,
+        output_root,
+        repo_id="local/test-umi-no-streaming",
+        cameras="fisheye_rgb",
+        camera_storage="video",
+        streaming_encoding=False,
+        vcodec="libsvtav1",
+    )
+
+    assert manifest["streaming_encoding"] is False
+    assert manifest["vcodec"] == "libsvtav1"
+    assert calls[0]["use_videos"] is True
+    assert calls[0]["streaming_encoding"] is False
+    assert calls[0]["vcodec"] == "libsvtav1"
 
 
 @pytest.mark.skipif(not DATASETS_AVAILABLE, reason="datasets extra required")

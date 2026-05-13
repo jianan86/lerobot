@@ -731,6 +731,7 @@ class StreamingVideoEncoder:
         preset: int | None = None,
         queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        drop_frames: bool = True,
     ):
         self.fps = fps
         self.vcodec = resolve_vcodec(vcodec)
@@ -740,6 +741,7 @@ class StreamingVideoEncoder:
         self.preset = preset
         self.queue_maxsize = queue_maxsize
         self.encoder_threads = encoder_threads
+        self.drop_frames = drop_frames
 
         self._frame_queues: dict[str, queue.Queue] = {}
         self._result_queues: dict[str, queue.Queue] = {}
@@ -797,9 +799,10 @@ class StreamingVideoEncoder:
         """Feed a frame to the encoder for a specific camera.
 
         A copy of the image is made before enqueueing to prevent race conditions
-        with camera drivers that may reuse buffers. If the encoder queue is full
-        (encoder can't keep up), the frame is dropped with a warning instead of
-        crashing the recording session.
+        with camera drivers that may reuse buffers. When drop_frames is True and
+        the encoder queue is full, the frame is dropped with a warning instead
+        of crashing the recording session. When drop_frames is False, this call
+        blocks until the frame can be queued.
 
         Args:
             video_key: The video feature key
@@ -822,17 +825,20 @@ class StreamingVideoEncoder:
                 pass
             raise RuntimeError(f"Encoder thread for {video_key} is not alive")
 
-        try:
-            self._frame_queues[video_key].put(image.copy(), timeout=0.1)
-        except queue.Full:
-            self._dropped_frames[video_key] = self._dropped_frames.get(video_key, 0) + 1
-            count = self._dropped_frames[video_key]
-            # Log periodically to avoid spam (1st, then every 10th)
-            if count == 1 or count % 10 == 0:
-                logger.warning(
-                    f"Encoder queue full for {video_key}, dropped {count} frame(s). "
-                    f"Consider using vcodec='auto' for hardware encoding or increasing encoder_queue_maxsize."
-                )
+        if self.drop_frames:
+            try:
+                self._frame_queues[video_key].put(image.copy(), timeout=0.1)
+            except queue.Full:
+                self._dropped_frames[video_key] = self._dropped_frames.get(video_key, 0) + 1
+                count = self._dropped_frames[video_key]
+                # Log periodically to avoid spam (1st, then every 10th)
+                if count == 1 or count % 10 == 0:
+                    logger.warning(
+                        f"Encoder queue full for {video_key}, dropped {count} frame(s). "
+                        f"Consider using vcodec='auto' for hardware encoding or increasing encoder_queue_maxsize."
+                    )
+        else:
+            self._frame_queues[video_key].put(image.copy())
 
     def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
         """Finish encoding the current episode.
