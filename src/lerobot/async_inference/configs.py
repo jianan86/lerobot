@@ -125,6 +125,20 @@ class PolicyServerConfig:
             "blocks inference."
         },
     )
+    inference_backend: str = field(
+        default="torch",
+        metadata={"help": "Policy inference backend. Supported values: 'torch', 'tensorrt'."},
+    )
+    tensorrt_build_engine: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, build <pretrained_name_or_path>/model.engine from the loaded PyTorch checkpoint."
+        },
+    )
+    tensorrt_fp16: bool = field(
+        default=True,
+        metadata={"help": "If True, enable FP16 when building a TensorRT engine."},
+    )
     jitter_dump_dir: str | None = field(
         default=None,
         metadata={
@@ -162,6 +176,14 @@ class PolicyServerConfig:
         if self.diagnostics_dump_dir is not None and not str(self.diagnostics_dump_dir).strip():
             raise ValueError("diagnostics_dump_dir cannot be an empty string")
 
+        if self.inference_backend not in {"torch", "tensorrt"}:
+            raise ValueError(
+                f"inference_backend must be one of ['torch', 'tensorrt'], got {self.inference_backend!r}"
+            )
+
+        if self.inference_backend != "tensorrt" and self.tensorrt_build_engine:
+            raise ValueError("tensorrt_build_engine requires inference_backend='tensorrt'")
+
     @property
     def effective_diagnostics_dump_dir(self) -> str | None:
         return self.diagnostics_dump_dir if self.diagnostics_dump_dir is not None else self.jitter_dump_dir
@@ -190,6 +212,7 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "inference_backend": self.inference_backend,
         }
 
 

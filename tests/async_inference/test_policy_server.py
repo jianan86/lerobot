@@ -17,14 +17,16 @@ Monkey-patch the `policy` attribute with a stub so that no real model inference 
 
 from __future__ import annotations
 
+import pickle
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
-from lerobot.configs.types import PolicyFeature
-from lerobot.utils.constants import OBS_STATE
+from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 from tests.utils import skip_if_package_missing
 
 # -----------------------------------------------------------------------------
@@ -390,3 +392,115 @@ def test_pose_act_visualization_publish_overwrites_latest_frame():
 
     queued = server._pose_act_vis_frame_queue.get_nowait()
     assert np.array_equal(queued, frame_b)
+
+
+def test_policy_server_config_validates_tensorrt_backend():
+    from lerobot.async_inference.configs import PolicyServerConfig
+
+    assert PolicyServerConfig(inference_backend="torch").inference_backend == "torch"
+    assert PolicyServerConfig(inference_backend="tensorrt").inference_backend == "tensorrt"
+    assert PolicyServerConfig(inference_backend="tensorrt", tensorrt_build_engine=True).tensorrt_build_engine
+
+    with pytest.raises(ValueError, match="inference_backend"):
+        PolicyServerConfig(inference_backend="bad")
+
+    with pytest.raises(ValueError, match="tensorrt_build_engine requires"):
+        PolicyServerConfig(tensorrt_build_engine=True)
+
+
+def test_policy_server_tensorrt_uses_model_engine_from_pretrained_path(monkeypatch, tmp_path):
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+    from lerobot.transport import services_pb2
+
+    class PolicyStub:
+        name = "pose_act"
+
+        class _Config:
+            image_features = {}
+
+        config = _Config()
+
+        @classmethod
+        def from_pretrained(cls, _path):
+            return cls()
+
+        def to(self, _device):
+            return self
+
+    captured = {}
+
+    class AdapterStub:
+        def __init__(self, policy, engine_path, *, build_engine, fp16):
+            captured["policy"] = policy
+            captured["engine_path"] = Path(engine_path)
+            captured["build_engine"] = build_engine
+            captured["fp16"] = fp16
+
+    monkeypatch.setattr("lerobot.async_inference.policy_server.get_policy_class", lambda _name: PolicyStub)
+    monkeypatch.setattr("lerobot.async_inference.policy_server.make_pre_post_processors", lambda *a, **k: (None, None))
+    monkeypatch.setattr("lerobot.async_inference.policy_server.PoseACTTensorRTPolicyAdapter", AdapterStub)
+
+    server = PolicyServer(PolicyServerConfig(inference_backend="tensorrt"))
+    server.shutdown_event.clear()
+    model_dir = tmp_path / "pretrained_model"
+    request = services_pb2.PolicySetup(
+        data=pickle.dumps(
+            RemotePolicyConfig(
+                policy_type="pose_act",
+                pretrained_name_or_path=str(model_dir),
+                lerobot_features={},
+                actions_per_chunk=4,
+                device="cuda",
+            )
+        )
+    )
+
+    server.SendPolicyInstructions(request, context=type("Context", (), {"peer": lambda self: "test"})())
+
+    assert captured["engine_path"] == model_dir / "model.engine"
+    assert captured["build_engine"] is False
+
+
+def test_pose_act_tensorrt_adapter_prepares_model_inputs():
+    from lerobot.async_inference.tensorrt import PoseACTTensorRTPolicyAdapter
+    from lerobot.policies.pose_act.configuration_pose_act import PoseACTConfig
+    from lerobot.utils.constants import ACTION
+
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        input_features={
+            "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+    )
+
+    class PoseACTStub:
+        def __init__(self, cfg):
+            self.config = cfg
+
+        def _prepare_batch(self, observation):
+            return {
+                OBS_STATE: observation[OBS_STATE].flatten(start_dim=1),
+                OBS_IMAGES: [
+                    observation["observation.images.fisheye_rgb"][:, 0],
+                    observation["observation.images.fisheye_rgb"][:, 1],
+                ],
+            }
+
+    adapter = PoseACTTensorRTPolicyAdapter.__new__(PoseACTTensorRTPolicyAdapter)
+    adapter.policy = PoseACTStub(config)
+    adapter.config = config
+
+    inputs = adapter._prepare_inputs(
+        {
+            OBS_STATE: torch.zeros(1, 2, 10),
+            "observation.images.fisheye_rgb": torch.zeros(1, 2, 3, 16, 16),
+        }
+    )
+
+    assert [tuple(tensor.shape) for tensor in inputs] == [(1, 20), (1, 3, 16, 16), (1, 3, 16, 16)]
+    assert all(tensor.is_contiguous() for tensor in inputs)

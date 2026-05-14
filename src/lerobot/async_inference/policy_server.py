@@ -45,7 +45,7 @@ import numpy as np
 import torch
 
 from lerobot.policies import get_policy_class, make_pre_post_processors
-from lerobot.policies.pose_act.utils import pose10d_to_pose7d, pose7d_to_pose10d
+from lerobot.policies.pose_act.utils import pose7d_to_pose10d, pose10d_to_pose7d
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -55,9 +55,9 @@ from lerobot.transport.utils import receive_bytes_in_chunks
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import OBS_STATE
 
+from .async_diagnostics import AsyncDiagnosticsWriter, chunk_intra_diff_stats
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
-from .async_diagnostics import AsyncDiagnosticsWriter, chunk_intra_diff_stats
 from .helpers import (
     FPSTracker,
     Observation,
@@ -70,6 +70,7 @@ from .helpers import (
     raw_observation_to_observation,
     resize_robot_observation_image,
 )
+from .tensorrt import PoseACTTensorRTPolicyAdapter
 
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
@@ -369,9 +370,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             postprocessor_overrides={"device_processor": device_override},
         )
 
+        if self.config.inference_backend == "tensorrt":
+            engine_path = Path(policy_specs.pretrained_name_or_path) / "model.engine"
+            self.policy = PoseACTTensorRTPolicyAdapter(
+                self.policy,
+                engine_path,
+                build_engine=self.config.tensorrt_build_engine,
+                fp16=self.config.tensorrt_fp16,
+            )
+
         end = time.perf_counter()
 
-        self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
+        self.logger.info(
+            f"Time taken to put policy on {self.device} "
+            f"(backend={self.config.inference_backend}): {end - start:.4f} seconds"
+        )
 
         return services_pb2.Empty()
 
