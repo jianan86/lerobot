@@ -252,6 +252,17 @@ def load_image_as_numpy(
     return img_array
 
 
+def load_depth_image_as_numpy(fpath: str | Path, channel_first: bool = True) -> np.ndarray:
+    """Load a 16-bit single-channel depth PNG without normalizing its values."""
+    with PILImage.open(fpath) as image:
+        img_array = np.asarray(image, dtype=np.uint16).copy()
+    if img_array.ndim != 2:
+        raise ValueError(f"Expected a single-channel depth image at {fpath}, got shape {img_array.shape}")
+    if channel_first:
+        img_array = img_array[None, :, :]
+    return img_array
+
+
 def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[torch.Tensor | str]]:
     """Convert a batch from a Hugging Face dataset to torch tensors.
 

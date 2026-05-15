@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 
 from lerobot.scripts.convert_umi_to_lerobot_v30 import (
-    build_state_vector,
-    compute_aligned_length,
     CONVERSION_ENCODER_QUEUE_MAXSIZE,
     CONVERSION_ENCODER_THREADS,
     CONVERSION_IMAGE_WRITER_PROCESSES,
     CONVERSION_IMAGE_WRITER_THREADS,
+    build_state_vector,
+    compute_aligned_length,
     convert_episode,
     convert_episodes,
     discover_episode_dirs,
@@ -222,8 +224,8 @@ def test_infer_features_uses_selected_camera_shapes_and_video_dtype(tmp_path):
     assert features["observation.images.depth_camera_rgb"]["dtype"] == "video"
     assert features["observation.images.fisheye_rgb"]["shape"] == (3, 12, 16)
     assert features["observation.images.fisheye_rgb"]["dtype"] == "video"
-    assert features["observation.depth.depth_camera"]["shape"] == (12, 16)
-    assert features["observation.depth.depth_camera"]["dtype"] == "uint16"
+    assert features["observation.depth.depth_camera"]["shape"] == (1, 12, 16)
+    assert features["observation.depth.depth_camera"]["dtype"] == "depth_image"
 
 
 def test_build_state_vector_uses_raw_xyz_euler_and_gripper_width(tmp_path):
@@ -396,6 +398,28 @@ def test_convert_episode_writes_local_lerobot_dataset(tmp_path):
 
 
 @pytest.mark.skipif(not DATASETS_AVAILABLE, reason="datasets extra required")
+def test_convert_episode_writes_rgb_only_without_depth_directory(tmp_path):
+    from lerobot.datasets import LeRobotDataset
+
+    episode = _make_episode(tmp_path, frames=2)
+    shutil.rmtree(episode / "camera/depth")
+    output_root = tmp_path / "output"
+
+    manifest = convert_episode(
+        episode,
+        output_root,
+        repo_id="local/test-umi-rgb-only",
+        fps=30,
+        cameras="fisheye_rgb",
+    )
+    dataset = LeRobotDataset("local/test-umi-rgb-only", root=output_root)
+
+    assert manifest["cameras"] == ("fisheye_rgb",)
+    assert "observation.depth.depth_camera" not in dataset.meta.features
+    assert tuple(dataset[0]["observation.images.fisheye_rgb"].shape) == (3, 12, 16)
+
+
+@pytest.mark.skipif(not DATASETS_AVAILABLE, reason="datasets extra required")
 def test_convert_episode_writes_fractional_frame_range(tmp_path):
     from lerobot.datasets import LeRobotDataset
 
@@ -503,10 +527,11 @@ def test_convert_episode_writes_selected_depth_camera(tmp_path):
 
     assert manifest["cameras"] == ("fisheye_rgb", "depth_camera")
     assert dataset.meta.features["observation.images.fisheye_rgb"]["dtype"] == "image"
-    assert dataset.meta.features["observation.depth.depth_camera"]["dtype"] == "uint16"
+    assert dataset.meta.features["observation.depth.depth_camera"]["dtype"] == "depth_image"
     item = dataset[0]
     assert tuple(item["observation.images.fisheye_rgb"].shape) == (3, 12, 16)
-    assert tuple(item["observation.depth.depth_camera"].shape) == (12, 16)
+    assert tuple(item["observation.depth.depth_camera"].shape) == (1, 12, 16)
+    assert item["observation.depth.depth_camera"].dtype == torch.uint16
 
 
 def test_discover_episode_files_finds_expected_modalities(tmp_path):

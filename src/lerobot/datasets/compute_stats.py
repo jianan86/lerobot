@@ -22,7 +22,7 @@ import numpy as np
 from lerobot.processor import RelativeActionsProcessorStep
 from lerobot.utils.constants import ACTION, OBS_STATE
 
-from .io_utils import load_image_as_numpy
+from .io_utils import load_depth_image_as_numpy, load_image_as_numpy
 
 DEFAULT_QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 
@@ -246,6 +246,21 @@ def sample_images(image_paths: list[str]) -> np.ndarray:
 
         if images is None:
             images = np.empty((len(sampled_indices), *img.shape), dtype=np.uint8)
+
+        images[i] = img
+
+    return images
+
+
+def sample_depth_images(image_paths: list[str]) -> np.ndarray:
+    sampled_indices = sample_indices(len(image_paths))
+
+    images = None
+    for i, idx in enumerate(sampled_indices):
+        img = load_depth_image_as_numpy(image_paths[idx], channel_first=True)
+
+        if images is None:
+            images = np.empty((len(sampled_indices), *img.shape), dtype=np.uint16)
 
         images[i] = img
 
@@ -517,6 +532,10 @@ def compute_episode_stats(
 
         if features[key]["dtype"] in ["image", "video"]:
             ep_ft_array = sample_images(data)
+            axes_to_reduce = (0, 2, 3)
+            keepdims = True
+        elif features[key]["dtype"] == "depth_image":
+            ep_ft_array = sample_depth_images(data).astype(np.float32)
             axes_to_reduce = (0, 2, 3)
             keepdims = True
         else:

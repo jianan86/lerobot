@@ -144,6 +144,23 @@ class DatasetWriter:
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
         return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
 
+    def _save_depth_image(self, depth_image: str | Path | np.ndarray | PIL.Image.Image, fpath: Path) -> None:
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(depth_image, (str, Path)):
+            src_path = Path(depth_image)
+            if src_path.resolve() != fpath.resolve():
+                shutil.copy2(src_path, fpath)
+            return
+
+        if isinstance(depth_image, PIL.Image.Image):
+            image = depth_image
+        else:
+            array = depth_image
+            if array.ndim == 3 and array.shape[0] == 1:
+                array = array[0]
+            image = PIL.Image.fromarray(array)
+        image.save(fpath, compress_level=1)
+
     def _save_image(
         self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1
     ) -> None:
@@ -208,6 +225,12 @@ class DatasetWriter:
                 compress_level = 1 if self._meta.features[key]["dtype"] == "video" else 6
                 self._save_image(frame[key], img_path, compress_level)
                 self.episode_buffer[key].append(str(img_path))
+            elif self._meta.features[key]["dtype"] == "depth_image":
+                depth_path = self._get_image_file_path(
+                    episode_index=self.episode_buffer["episode_index"], image_key=key, frame_index=frame_index
+                )
+                self._save_depth_image(frame[key], depth_path)
+                self.episode_buffer[key].append(str(depth_path))
             else:
                 self.episode_buffer[key].append(frame[key])
 
@@ -239,7 +262,11 @@ class DatasetWriter:
         episode_buffer["task_index"] = np.array([self._meta.get_task_index(task) for task in tasks])
 
         for key, ft in self._meta.features.items():
-            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
+            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in [
+                "image",
+                "video",
+                "depth_image",
+            ]:
                 continue
             episode_buffer[key] = np.stack(episode_buffer[key])
 
@@ -373,6 +400,9 @@ class DatasetWriter:
         # Use metadata features as the authoritative schema
         hf_features = get_hf_features_from_features(self._meta.features)
         ep_dict = {key: episode_buffer[key] for key in hf_features}
+        for key in self._meta.depth_image_keys:
+            if key in ep_dict:
+                ep_dict[key] = [str(Path(path).relative_to(self._root)) for path in ep_dict[key]]
         ep_dataset = datasets.Dataset.from_dict(ep_dict, features=hf_features, split="train")
         ep_dataset = embed_images(ep_dataset)
         ep_num_frames = len(ep_dataset)

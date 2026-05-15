@@ -30,6 +30,7 @@ from .feature_utils import (
 )
 from .io_utils import (
     hf_transform_to_torch,
+    load_depth_image_as_numpy,
     load_nested_dataset,
 )
 from .video_utils import decode_video_frames
@@ -265,8 +266,18 @@ class DatasetReader:
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
-            result[key] = torch.stack(self._select_columns((key,))[relative_indices][key])
+            values = self._select_columns((key,))[relative_indices][key]
+            if key in self._meta.depth_image_keys:
+                result[key] = torch.stack([self._load_depth_image(path) for path in values])
+            else:
+                result[key] = torch.stack(values)
         return result
+
+    def _load_depth_image(self, path: str) -> torch.Tensor:
+        fpath = Path(path)
+        if not fpath.is_absolute():
+            fpath = self.root / fpath
+        return torch.from_numpy(load_depth_image_as_numpy(fpath, channel_first=True))
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
@@ -327,6 +338,10 @@ class DatasetReader:
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
+
+        for key in self._meta.depth_image_keys:
+            if key in item and isinstance(item[key], str):
+                item[key] = self._load_depth_image(item[key])
 
         if self._image_transforms is not None:
             image_keys = self._meta.camera_keys

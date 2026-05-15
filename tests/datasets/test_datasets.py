@@ -360,6 +360,33 @@ def test_add_frame_image_pil(image_dataset):
     assert dataset[0]["image"].shape == torch.Size(DUMMY_CHW)
 
 
+def test_add_frame_depth_image_path_preserves_uint16_png(tmp_path):
+    root = tmp_path / "test"
+    source_depth = tmp_path / "source_depth.png"
+    depth = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    Image.fromarray(depth).save(source_depth)
+    features = {
+        "observation.depth.depth_camera": {
+            "dtype": "depth_image",
+            "shape": (1, 3, 4),
+            "names": None,
+        }
+    }
+    dataset = LeRobotDataset.create(repo_id=DUMMY_REPO_ID, fps=30, features=features, root=root)
+
+    dataset.add_frame({"observation.depth.depth_camera": source_depth, "task": "Dummy task"})
+    dataset.save_episode()
+    dataset.finalize()
+
+    copied_depth = root / "images/observation.depth.depth_camera/episode-000000/frame-000000.png"
+    assert copied_depth.is_file()
+    np.testing.assert_array_equal(np.asarray(Image.open(copied_depth)), depth)
+    item = dataset[0]
+    assert item["observation.depth.depth_camera"].dtype == torch.uint16
+    assert item["observation.depth.depth_camera"].shape == torch.Size((1, 3, 4))
+    torch.testing.assert_close(item["observation.depth.depth_camera"], torch.from_numpy(depth[None, :, :]))
+
+
 def test_set_image_transforms_applies_transparently(image_dataset):
     dataset = image_dataset
     dataset.add_frame({"image": np.random.rand(*DUMMY_CHW), "task": "Dummy task"})

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from pathlib import Path
 from pprint import pformat
 
 import datasets
@@ -49,6 +50,8 @@ def get_hf_features_from_features(features: dict) -> datasets.Features:
             continue
         elif ft["dtype"] == "image":
             hf_features[key] = datasets.Image()
+        elif ft["dtype"] == "depth_image":
+            hf_features[key] = datasets.Value(dtype="string")
         elif ft["shape"] == (1,):
             hf_features[key] = datasets.Value(dtype=ft["dtype"])
         elif len(ft["shape"]) == 1:
@@ -219,7 +222,7 @@ def validate_features_presence(actual_features: set[str], expected_features: set
 
 
 def validate_feature_dtype_and_shape(
-    name: str, feature: dict, value: np.ndarray | PILImage.Image | str
+    name: str, feature: dict, value: np.ndarray | PILImage.Image | str | Path
 ) -> str:
     """Validate the dtype and shape of a single feature's value.
 
@@ -240,6 +243,8 @@ def validate_feature_dtype_and_shape(
         return validate_feature_numpy_array(name, expected_dtype, expected_shape, value)
     elif expected_dtype in ["image", "video"]:
         return validate_feature_image_or_video(name, expected_shape, value)
+    elif expected_dtype == "depth_image":
+        return validate_feature_depth_image(name, expected_shape, value)
     elif expected_dtype == "string":
         return validate_feature_string(name, value)
     else:
@@ -304,6 +309,45 @@ def validate_feature_image_or_video(
         error_message += f"The feature '{name}' is expected to be of type 'PIL.Image' or 'np.ndarray' channel first or channel last, but type '{type(value)}' provided instead.\n"
 
     return error_message
+
+
+def validate_feature_depth_image(
+    name: str, expected_shape: tuple[int, ...], value: np.ndarray | PILImage.Image | str | Path
+) -> str:
+    """Validate a single-channel uint16 depth PNG feature."""
+    if len(expected_shape) == 3:
+        if expected_shape[0] != 1:
+            return f"The depth image feature '{name}' must have one channel, got shape '{expected_shape}'.\n"
+        expected_hw = expected_shape[1:]
+    elif len(expected_shape) == 2:
+        expected_hw = expected_shape
+    else:
+        return f"The depth image feature '{name}' must have shape '(1, H, W)' or '(H, W)', got '{expected_shape}'.\n"
+
+    if isinstance(value, (str, Path)):
+        path = Path(value)
+        if not path.is_file():
+            return f"The depth image feature '{name}' points to a missing file: {path}.\n"
+        if path.suffix.lower() != ".png":
+            return f"The depth image feature '{name}' must point to a PNG file, got: {path}.\n"
+        return ""
+    elif isinstance(value, PILImage.Image):
+        array = np.asarray(value)
+    elif isinstance(value, np.ndarray):
+        array = value
+    else:
+        return f"The depth image feature '{name}' is expected to be a path, PIL.Image, or np.ndarray, but type '{type(value)}' provided instead.\n"
+
+    if array.ndim == 3 and array.shape[0] == 1:
+        array = array[0]
+
+    if array.ndim != 2:
+        return f"The depth image feature '{name}' must be single-channel, got shape '{array.shape}'.\n"
+    if array.dtype != np.uint16:
+        return f"The depth image feature '{name}' must have dtype 'uint16', got '{array.dtype}'.\n"
+    if tuple(array.shape) != tuple(expected_hw):
+        return f"The depth image feature '{name}' of shape '{array.shape}' does not have the expected shape '{expected_hw}'.\n"
+    return ""
 
 
 def validate_feature_string(name: str, value: str) -> str:
