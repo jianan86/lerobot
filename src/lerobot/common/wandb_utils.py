@@ -71,6 +71,26 @@ def get_safe_wandb_artifact_name(name: str):
     return name.replace(":", "_").replace("/", "_")
 
 
+def _get_wandb_gpu_device_ids_from_env() -> list[int] | None:
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not cuda_visible_devices:
+        return None
+
+    device_ids = []
+    for device_id in cuda_visible_devices.split(","):
+        device_id = device_id.strip()
+        if not device_id.isdigit():
+            logging.warning(
+                "Could not map CUDA_VISIBLE_DEVICES=%s to W&B GPU device IDs. "
+                "W&B will use its default GPU monitoring behavior.",
+                cuda_visible_devices,
+            )
+            return None
+        device_ids.append(int(device_id))
+
+    return device_ids
+
+
 class WandBLogger:
     """A helper class to log object using wandb."""
 
@@ -92,6 +112,7 @@ class WandBLogger:
             if cfg.resume
             else None
         )
+        gpu_device_ids = _get_wandb_gpu_device_ids_from_env()
         wandb.init(
             id=wandb_run_id,
             project=self.cfg.project,
@@ -107,6 +128,7 @@ class WandBLogger:
             job_type="train_eval",
             resume="must" if cfg.resume else None,
             mode=self.cfg.mode if self.cfg.mode in ["online", "offline", "disabled"] else "online",
+            settings=wandb.Settings(x_stats_gpu_device_ids=gpu_device_ids),
         )
         run_id = wandb.run.id
         # NOTE: We will override the cfg.wandb.run_id with the wandb run id.
