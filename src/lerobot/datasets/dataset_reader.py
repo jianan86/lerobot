@@ -79,6 +79,7 @@ class DatasetReader:
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
+        self._column_cache: dict[tuple[str, ...], datasets.Dataset] = {}
 
         # Setup delta_indices (doesn't depend on hf_dataset)
         self.delta_indices = None
@@ -90,11 +91,14 @@ class DatasetReader:
         """Attempt to load from local cache. Returns True if data is sufficient."""
         try:
             self.hf_dataset = self._load_hf_dataset()
+            self._clear_column_cache()
         except (FileNotFoundError, NotADirectoryError):
             self.hf_dataset = None
+            self._clear_column_cache()
             return False
         if not self._check_cached_episodes_sufficient():
             self.hf_dataset = None
+            self._clear_column_cache()
             return False
         self._build_index_mapping()
         return True
@@ -102,6 +106,7 @@ class DatasetReader:
     def load_and_activate(self) -> None:
         """Load HF dataset from disk and build index mapping. Call after data is on disk."""
         self.hf_dataset = self._load_hf_dataset()
+        self._clear_column_cache()
         self._build_index_mapping()
 
     def _build_index_mapping(self) -> None:
@@ -129,6 +134,39 @@ class DatasetReader:
         hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
+
+    def _clear_column_cache(self) -> None:
+        self._column_cache = {}
+
+    def _select_columns(self, columns: list[str] | tuple[str, ...]) -> datasets.Dataset:
+        """Return a cached narrow view of the HF dataset for fast indexed reads."""
+        if self.hf_dataset is None:
+            raise RuntimeError("Cannot select columns before hf_dataset is loaded.")
+
+        key = tuple(columns)
+        if key not in self._column_cache:
+            self._column_cache[key] = self.hf_dataset.select_columns(list(key))
+        return self._column_cache[key]
+
+    def _get_current_item(self, idx: int) -> dict:
+        """Read the current row without unused observation payloads when delta windows are active."""
+        if self.hf_dataset is None:
+            raise RuntimeError("Cannot query item before hf_dataset is loaded.")
+
+        if self.delta_indices is None:
+            return self.hf_dataset[idx]
+
+        required_columns = {"index", "episode_index", "frame_index", "timestamp", "task_index"}
+        if "subtask_index" in self._meta.features:
+            required_columns.add("subtask_index")
+
+        current_columns = [
+            key
+            for key in self.hf_dataset.column_names
+            if key in required_columns
+            or (not key.startswith("observation.") and key not in self.delta_indices)
+        ]
+        return self._select_columns(current_columns)[idx]
 
     def _check_cached_episodes_sufficient(self) -> bool:
         """Check if the cached dataset contains all requested episodes and their video files."""
@@ -207,9 +245,9 @@ class DatasetReader:
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
-                    timestamps = self.hf_dataset[relative_indices]["timestamp"]
                 else:
-                    timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
+                    relative_indices = query_indices[key]
+                timestamps = self._select_columns(("timestamp",))[relative_indices]["timestamp"]
                 query_timestamps[key] = torch.stack(timestamps).tolist()
             else:
                 query_timestamps[key] = [current_ts]
@@ -227,10 +265,7 @@ class DatasetReader:
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
-            try:
-                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
-            except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+            result[key] = torch.stack(self._select_columns((key,))[relative_indices][key])
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
@@ -271,7 +306,7 @@ class DatasetReader:
         HF dataset, **not** the absolute frame index stored in the ``index``
         column.  The absolute index is retrieved from the row itself.
         """
-        item = self.hf_dataset[idx]
+        item = self._get_current_item(idx)
         ep_idx = item["episode_index"].item()
         abs_idx = item["index"].item()
 
@@ -283,7 +318,7 @@ class DatasetReader:
             for key, val in query_result.items():
                 item[key] = val
             for key in list(item):
-                if key.startswith("observation.") and key not in query_indices:
+                if key.startswith("observation.") and not key.endswith("_is_pad") and key not in query_indices:
                     item.pop(key, None)
                     item.pop(f"{key}_is_pad", None)
 

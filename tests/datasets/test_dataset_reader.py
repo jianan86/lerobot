@@ -16,10 +16,12 @@
 """Contract tests for DatasetReader."""
 
 import pytest
+import torch
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.datasets.dataset_reader import DatasetReader
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.import_utils import get_safe_default_codec
 
 # ── Loading ──────────────────────────────────────────────────────────
@@ -119,6 +121,43 @@ def test_get_item_values_are_correct(tmp_path, lerobot_dataset_factory):
 
     assert item_0["index"].item() == 0
     assert item_0["episode_index"].item() == 0
+
+
+def test_get_item_with_delta_timestamps_uses_only_requested_observation_columns(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    """Delta reads should not materialize observation columns that will be discarded."""
+    features = {
+        "observation.state": {"dtype": "float32", "shape": (1,), "names": ["x"]},
+        "observation.unused": {"dtype": "float32", "shape": (2,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "ds", features=features, use_videos=False, fps=10
+    )
+
+    for frame_idx in range(3):
+        dataset.add_frame(
+            {
+                "observation.state": torch.tensor([frame_idx], dtype=torch.float32),
+                "observation.unused": torch.tensor([frame_idx, frame_idx + 1], dtype=torch.float32),
+                "task": "task",
+            }
+        )
+    dataset.save_episode()
+    dataset.finalize()
+
+    loaded = LeRobotDataset(
+        dataset.repo_id,
+        root=dataset.root,
+        delta_timestamps={"observation.state": [-0.1, 0.0]},
+        tolerance_s=0.04,
+    )
+
+    item = loaded[1]
+
+    assert item["observation.state"].tolist() == [0.0, 1.0]
+    assert "observation.unused" not in item
+    assert ("observation.unused",) not in loaded.reader._column_cache
 
 
 # ── Transforms ───────────────────────────────────────────────────────
