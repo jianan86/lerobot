@@ -43,7 +43,11 @@ from lerobot.datasets.utils import (
     DEFAULT_VIDEO_FILE_SIZE_IN_MB,
     create_branch,
 )
-from lerobot.datasets.video_utils import VALID_VIDEO_CODECS
+from lerobot.datasets.video_utils import (
+    VALID_VIDEO_CODECS,
+    decode_depth_video_frames,
+    encode_depth_video_frames,
+)
 from lerobot.envs.factory import make_env_config
 from lerobot.policies.factory import make_policy_config
 from lerobot.robots import make_robot_from_config
@@ -385,6 +389,63 @@ def test_add_frame_depth_image_path_preserves_uint16_png(tmp_path):
     assert item["observation.depth.depth_camera"].dtype == torch.uint16
     assert item["observation.depth.depth_camera"].shape == torch.Size((1, 3, 4))
     torch.testing.assert_close(item["observation.depth.depth_camera"], torch.from_numpy(depth[None, :, :]))
+
+
+def test_depth_video_ffv1_matroska_roundtrip_preserves_uint16(tmp_path):
+    video_path = tmp_path / "depth.mkv"
+    frames = []
+    for idx in range(4):
+        frame = np.arange(20, dtype=np.uint16).reshape(4, 5) + np.uint16(idx * 1000)
+        frame[2, 3] = np.uint16(12345 + idx)
+        frames.append(frame)
+
+    encode_depth_video_frames(frames, video_path, fps=30, overwrite=True)
+    decoded = decode_depth_video_frames(video_path, [idx / 30 for idx in range(4)], tolerance_s=1e-4)
+
+    for idx, expected in enumerate(frames):
+        np.testing.assert_array_equal(decoded[idx].numpy()[0], expected)
+    assert decoded[2, 0, 2, 3].item() == 12347
+
+
+def test_add_frame_depth_video_path_preserves_uint16_mkv(tmp_path):
+    root = tmp_path / "test"
+    source_depths = []
+    expected_depths = []
+    for idx in range(3):
+        source_depth = tmp_path / f"source_depth_{idx}.png"
+        depth = (np.arange(12, dtype=np.uint16).reshape(3, 4) + np.uint16(idx * 100)).copy()
+        depth[1, 2] = np.uint16(4000 + idx)
+        Image.fromarray(depth).save(source_depth)
+        source_depths.append(source_depth)
+        expected_depths.append(depth)
+
+    features = {
+        "observation.depth.depth_camera": {
+            "dtype": "depth_video",
+            "shape": (1, 3, 4),
+            "names": None,
+        }
+    }
+    dataset = LeRobotDataset.create(repo_id=DUMMY_REPO_ID, fps=30, features=features, root=root)
+
+    for source_depth in source_depths:
+        dataset.add_frame({"observation.depth.depth_camera": source_depth, "task": "Dummy task"})
+    dataset.save_episode()
+    dataset.finalize()
+
+    depth_video = root / "videos/observation.depth.depth_camera/chunk-000/file-000.mkv"
+    assert depth_video.is_file()
+    assert not (root / "images").exists()
+    assert dataset.meta.features["observation.depth.depth_camera"]["info"]["video.is_depth_map"] is True
+    assert dataset.meta.features["observation.depth.depth_camera"]["info"]["video.pix_fmt"] == "gray16le"
+
+    item = dataset[1]
+    assert item["observation.depth.depth_camera"].dtype == torch.uint16
+    assert item["observation.depth.depth_camera"].shape == torch.Size((1, 3, 4))
+    torch.testing.assert_close(
+        item["observation.depth.depth_camera"],
+        torch.from_numpy(expected_depths[1][None, :, :]),
+    )
 
 
 def test_set_image_transforms_applies_transparently(image_dataset):

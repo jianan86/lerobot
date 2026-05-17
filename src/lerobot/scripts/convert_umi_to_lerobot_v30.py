@@ -25,12 +25,12 @@ UMI episode layout:
 
 - camera/color/pikaFisheyeCamera    -> observation.images.fisheye_rgb (default)
 - camera/color/pikaDepthCamera      -> observation.images.depth_camera_rgb (optional)
-- camera/depth/pikaDepthCamera      -> observation.depth.depth_camera (optional, 16-bit PNG)
+- camera/depth/pikaDepthCamera      -> observation.depth.depth_camera (optional, lossless 16-bit video)
 - localization/pose/pika            -> observation.state[:6]
 - gripper/encoder/pika              -> observation.state[6]
 
-RGB cameras can be stored as images or videos. Depth images are kept as
-single-channel 16-bit PNG files and referenced from the LeRobot dataset.
+RGB cameras can be stored as images or videos. Depth is always stored as
+lossless FFV1/Matroska 16-bit video.
 
 Since the sample data does not include a separate robot control stream,
 `action` defaults to the same 7D raw pose vector as `observation.state`:
@@ -374,7 +374,7 @@ def infer_features(
         elif camera == DEPTH_CAMERA:
             depth_array = load_depth_image(modality_files[camera][0])
             features[DEPTH_CAMERA_FEATURE] = {
-                "dtype": "depth_image",
+                "dtype": "depth_video",
                 "shape": (1, *depth_array.shape),
                 "names": None,
             }
@@ -389,17 +389,17 @@ def infer_features(
 
 
 def camera_features_use_video(features: dict[str, dict[str, Any]]) -> bool:
-    return any(feature["dtype"] == "video" for feature in features.values())
+    return any(feature["dtype"] in {"video", "depth_video"} for feature in features.values())
 
 
 def conversion_uses_streaming_encoding(
     features: dict[str, dict[str, Any]],
     streaming_encoding: bool | None,
 ) -> bool:
-    use_videos = camera_features_use_video(features)
+    use_rgb_videos = any(feature["dtype"] == "video" for feature in features.values())
     if streaming_encoding is None:
-        return use_videos
-    return bool(streaming_encoding) and use_videos
+        return use_rgb_videos
+    return bool(streaming_encoding) and use_rgb_videos
 
 
 def create_conversion_dataset(
@@ -787,7 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--camera-storage",
         choices=CAMERA_STORAGE_CHOICES,
         default="image",
-        help="Store RGB camera observations as parquet images or encoded videos. Depth stays 16-bit PNG.",
+        help="Store RGB camera observations as parquet images or encoded videos. Depth is always lossless 16-bit video.",
     )
     parser.add_argument(
         "--vcodec",

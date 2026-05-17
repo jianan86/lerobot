@@ -33,7 +33,7 @@ from .io_utils import (
     load_depth_image_as_numpy,
     load_nested_dataset,
 )
-from .video_utils import decode_video_frames
+from .video_utils import decode_depth_video_frames, decode_video_frames
 
 
 class DatasetReader:
@@ -187,9 +187,9 @@ class DatasetReader:
         if not requested_episodes.issubset(available_episodes):
             return False
 
-        if len(self._meta.video_keys) > 0:
+        if len(self._meta.video_storage_keys) > 0:
             for ep_idx in requested_episodes:
-                for vid_key in self._meta.video_keys:
+                for vid_key in self._meta.video_storage_keys:
                     video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
                     if not video_path.exists():
                         return False
@@ -203,10 +203,10 @@ class DatasetReader:
         """
         episodes = self.episodes if self.episodes is not None else list(range(self._meta.total_episodes))
         fpaths = [str(self._meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
-        if len(self._meta.video_keys) > 0:
+        if len(self._meta.video_storage_keys) > 0:
             video_files = [
                 str(self._meta.get_video_file_path(ep_idx, vid_key))
-                for vid_key in self._meta.video_keys
+                for vid_key in self._meta.video_storage_keys
                 for ep_idx in episodes
             ]
             fpaths += video_files
@@ -239,7 +239,7 @@ class DatasetReader:
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        video_keys = self._meta.video_keys
+        video_keys = self._meta.video_storage_keys
         if query_indices is not None:
             video_keys = [key for key in video_keys if key in query_indices]
         for key in video_keys:
@@ -259,7 +259,7 @@ class DatasetReader:
         """Query dataset for indices across keys, skipping video keys."""
         result: dict = {}
         for key, q_idx in query_indices.items():
-            if key in self._meta.video_keys:
+            if key in self._meta.video_storage_keys:
                 continue
             relative_indices = (
                 q_idx
@@ -290,13 +290,16 @@ class DatasetReader:
             from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
             video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(
-                video_path,
-                shifted_query_ts,
-                self._tolerance_s,
-                self._video_backend,
-                return_uint8=self._return_uint8,
-            )
+            if vid_key in self._meta.depth_video_keys:
+                frames = decode_depth_video_frames(video_path, shifted_query_ts, self._tolerance_s)
+            else:
+                frames = decode_video_frames(
+                    video_path,
+                    shifted_query_ts,
+                    self._tolerance_s,
+                    self._video_backend,
+                    return_uint8=self._return_uint8,
+                )
             return vid_key, frames.squeeze(0)
 
         items = list(query_timestamps.items())
@@ -333,7 +336,7 @@ class DatasetReader:
                     item.pop(key, None)
                     item.pop(f"{key}_is_pad", None)
 
-        if len(self._meta.video_keys) > 0:
+        if len(self._meta.video_storage_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)

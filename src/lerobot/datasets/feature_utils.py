@@ -27,6 +27,7 @@ from .utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_DATA_PATH,
+    DEFAULT_DEPTH_VIDEO_PATH,
     DEFAULT_VIDEO_FILE_SIZE_IN_MB,
     DEFAULT_VIDEO_PATH,
 )
@@ -46,7 +47,7 @@ def get_hf_features_from_features(features: dict) -> datasets.Features:
     """
     hf_features = {}
     for key, ft in features.items():
-        if ft["dtype"] == "video":
+        if ft["dtype"] in ["video", "depth_video"]:
             continue
         elif ft["dtype"] == "image":
             hf_features[key] = datasets.Image()
@@ -107,6 +108,7 @@ def create_empty_dataset_info(
         "splits": {},
         "data_path": DEFAULT_DATA_PATH,
         "video_path": DEFAULT_VIDEO_PATH if use_videos else None,
+        "depth_video_path": DEFAULT_DEPTH_VIDEO_PATH if use_videos else None,
         "features": features,
     }
 
@@ -243,7 +245,7 @@ def validate_feature_dtype_and_shape(
         return validate_feature_numpy_array(name, expected_dtype, expected_shape, value)
     elif expected_dtype in ["image", "video"]:
         return validate_feature_image_or_video(name, expected_shape, value)
-    elif expected_dtype == "depth_image":
+    elif expected_dtype in ["depth_image", "depth_video"]:
         return validate_feature_depth_image(name, expected_shape, value)
     elif expected_dtype == "string":
         return validate_feature_string(name, value)

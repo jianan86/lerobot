@@ -53,6 +53,7 @@ from .utils import (
 from .video_utils import (
     StreamingVideoEncoder,
     concatenate_video_files,
+    encode_depth_video_frames,
     encode_video_frames,
     get_video_duration_in_s,
 )
@@ -231,6 +232,8 @@ class DatasetWriter:
                 )
                 self._save_depth_image(frame[key], depth_path)
                 self.episode_buffer[key].append(str(depth_path))
+            elif self._meta.features[key]["dtype"] == "depth_video":
+                self.episode_buffer[key].append(frame[key])
             else:
                 self.episode_buffer[key].append(frame[key])
 
@@ -266,6 +269,7 @@ class DatasetWriter:
                 "image",
                 "video",
                 "depth_image",
+                "depth_video",
             ]:
                 continue
             episode_buffer[key] = np.stack(episode_buffer[key])
@@ -289,6 +293,9 @@ class DatasetWriter:
             ep_stats = compute_episode_stats(episode_buffer, self._meta.features)
 
         ep_metadata = self._save_episode_data(episode_buffer)
+
+        for depth_video_key in self._meta.depth_video_keys:
+            ep_metadata.update(self._save_episode_video(depth_video_key, episode_index))
 
         if use_streaming:
             streaming_results = self._streaming_encoder.finish_episode()
@@ -469,6 +476,9 @@ class DatasetWriter:
         episode_index: int,
         temp_path: Path | None = None,
     ) -> dict:
+        video_path_template = (
+            self._meta.depth_video_path if video_key in self._meta.depth_video_keys else self._meta.video_path
+        )
         if temp_path is None:
             ep_path = self._encode_temporary_episode_video(video_key, episode_index)
         else:
@@ -490,7 +500,7 @@ class DatasetWriter:
                     old_chunk_idx, old_file_idx, self._meta.chunks_size
                 )
             latest_duration_in_s = 0.0
-            new_path = self._root / self._meta.video_path.format(
+            new_path = self._root / video_path_template.format(
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
             )
             new_path.parent.mkdir(parents=True, exist_ok=True)
@@ -500,7 +510,7 @@ class DatasetWriter:
             chunk_idx = latest_ep[f"videos/{video_key}/chunk_index"][0]
             file_idx = latest_ep[f"videos/{video_key}/file_index"][0]
 
-            latest_path = self._root / self._meta.video_path.format(
+            latest_path = self._root / video_path_template.format(
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
             )
             latest_size_in_mb = get_file_size_in_mb(latest_path)
@@ -508,7 +518,7 @@ class DatasetWriter:
 
             if latest_size_in_mb + ep_size_in_mb >= self._meta.video_files_size_in_mb:
                 chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self._meta.chunks_size)
-                new_path = self._root / self._meta.video_path.format(
+                new_path = self._root / video_path_template.format(
                     video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
                 )
                 new_path.parent.mkdir(parents=True, exist_ok=True)
@@ -593,6 +603,16 @@ class DatasetWriter:
 
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
         """Use ffmpeg to convert frames stored as png into mp4 videos."""
+        if video_key in self._meta.depth_video_keys:
+            temp_path = Path(tempfile.mkdtemp(dir=self._root)) / f"{video_key}_{episode_index:03d}.mkv"
+            encode_depth_video_frames(
+                self.episode_buffer[video_key],
+                temp_path,
+                self._meta.fps,
+                overwrite=True,
+            )
+            return temp_path
+
         return _encode_video_worker(
             video_key, episode_index, self._root, self._meta.fps, self._vcodec, self._encoder_threads
         )

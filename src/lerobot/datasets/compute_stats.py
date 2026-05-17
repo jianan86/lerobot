@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+from PIL import Image
 
 from lerobot.processor import RelativeActionsProcessorStep
 from lerobot.utils.constants import ACTION, OBS_STATE
@@ -252,12 +253,22 @@ def sample_images(image_paths: list[str]) -> np.ndarray:
     return images
 
 
-def sample_depth_images(image_paths: list[str]) -> np.ndarray:
+def sample_depth_images(image_paths: list[str | np.ndarray | Image.Image]) -> np.ndarray:
     sampled_indices = sample_indices(len(image_paths))
 
     images = None
     for i, idx in enumerate(sampled_indices):
-        img = load_depth_image_as_numpy(image_paths[idx], channel_first=True)
+        depth_item = image_paths[idx]
+        if isinstance(depth_item, np.ndarray):
+            img = depth_item
+            if img.ndim == 2:
+                img = img[None, :, :]
+        elif isinstance(depth_item, Image.Image):
+            img = np.asarray(depth_item, dtype=np.uint16)
+            if img.ndim == 2:
+                img = img[None, :, :]
+        else:
+            img = load_depth_image_as_numpy(depth_item, channel_first=True)
 
         if images is None:
             images = np.empty((len(sampled_indices), *img.shape), dtype=np.uint16)
@@ -534,7 +545,7 @@ def compute_episode_stats(
             ep_ft_array = sample_images(data)
             axes_to_reduce = (0, 2, 3)
             keepdims = True
-        elif features[key]["dtype"] == "depth_image":
+        elif features[key]["dtype"] in ["depth_image", "depth_video"]:
             ep_ft_array = sample_depth_images(data).astype(np.float32)
             axes_to_reduce = (0, 2, 3)
             keepdims = True

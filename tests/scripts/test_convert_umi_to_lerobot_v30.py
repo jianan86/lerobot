@@ -225,7 +225,7 @@ def test_infer_features_uses_selected_camera_shapes_and_video_dtype(tmp_path):
     assert features["observation.images.fisheye_rgb"]["shape"] == (3, 12, 16)
     assert features["observation.images.fisheye_rgb"]["dtype"] == "video"
     assert features["observation.depth.depth_camera"]["shape"] == (1, 12, 16)
-    assert features["observation.depth.depth_camera"]["dtype"] == "depth_image"
+    assert features["observation.depth.depth_camera"]["dtype"] == "depth_video"
 
 
 def test_build_state_vector_uses_raw_xyz_euler_and_gripper_width(tmp_path):
@@ -527,11 +527,14 @@ def test_convert_episode_writes_selected_depth_camera(tmp_path):
 
     assert manifest["cameras"] == ("fisheye_rgb", "depth_camera")
     assert dataset.meta.features["observation.images.fisheye_rgb"]["dtype"] == "image"
-    assert dataset.meta.features["observation.depth.depth_camera"]["dtype"] == "depth_image"
+    assert dataset.meta.features["observation.depth.depth_camera"]["dtype"] == "depth_video"
     item = dataset[0]
     assert tuple(item["observation.images.fisheye_rgb"].shape) == (3, 12, 16)
     assert tuple(item["observation.depth.depth_camera"].shape) == (1, 12, 16)
     assert item["observation.depth.depth_camera"].dtype == torch.uint16
+    assert (output_root / "videos/observation.depth.depth_camera/chunk-000/file-000.mkv").is_file()
+    assert not (output_root / "images/observation.depth.depth_camera").exists()
+    assert item["observation.depth.depth_camera"][0, 0, 0].item() == 100
 
 
 def test_discover_episode_files_finds_expected_modalities(tmp_path):

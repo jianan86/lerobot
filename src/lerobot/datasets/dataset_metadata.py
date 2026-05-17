@@ -277,7 +277,8 @@ class LeRobotDatasetMetadata:
         ep = self.episodes[ep_index]
         chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
         file_idx = ep[f"videos/{vid_key}/file_index"]
-        fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
+        video_path_template = self.depth_video_path if vid_key in self.depth_video_keys else self.video_path
+        fpath = video_path_template.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
         return Path(fpath)
 
     @property
@@ -289,6 +290,11 @@ class LeRobotDatasetMetadata:
     def video_path(self) -> str | None:
         """Formattable string for the video files."""
         return self.info["video_path"]
+
+    @property
+    def depth_video_path(self) -> str | None:
+        """Formattable string for the depth video files."""
+        return self.info.get("depth_video_path", self.info["video_path"])
 
     @property
     def robot_type(self) -> str | None:
@@ -316,9 +322,19 @@ class LeRobotDatasetMetadata:
         return [key for key, ft in self.features.items() if ft["dtype"] == "depth_image"]
 
     @property
+    def depth_video_keys(self) -> list[str]:
+        """Keys to access depth modalities stored as lossless 16-bit videos."""
+        return [key for key, ft in self.features.items() if ft["dtype"] == "depth_video"]
+
+    @property
     def video_keys(self) -> list[str]:
         """Keys to access visual modalities stored as videos."""
         return [key for key, ft in self.features.items() if ft["dtype"] == "video"]
+
+    @property
+    def video_storage_keys(self) -> list[str]:
+        """Keys stored under the videos directory."""
+        return self.video_keys + self.depth_video_keys
 
     @property
     def camera_keys(self) -> list[str]:
@@ -522,14 +538,25 @@ class LeRobotDatasetMetadata:
         Warning: this function writes info from first episode videos, implicitly assuming that all videos have
         been encoded the same way. Also, this means it assumes the first episode exists.
         """
-        if video_key is not None and video_key not in self.video_keys:
+        if video_key is not None and video_key not in self.video_storage_keys:
             raise ValueError(f"Video key {video_key} not found in dataset")
 
-        video_keys = [video_key] if video_key is not None else self.video_keys
+        video_keys = [video_key] if video_key is not None else self.video_storage_keys
         for key in video_keys:
             if not self.features[key].get("info", None):
-                video_path = self.root / self.video_path.format(video_key=key, chunk_index=0, file_index=0)
-                self.info["features"][key]["info"] = get_video_info(video_path)
+                if key in self.depth_video_keys:
+                    video_path_template = self.depth_video_path
+                else:
+                    video_path_template = self.video_path
+                video_path = self.root / video_path_template.format(
+                    video_key=key, chunk_index=0, file_index=0
+                )
+                video_info = get_video_info(video_path)
+                if key in self.depth_video_keys:
+                    video_info["video.is_depth_map"] = True
+                    video_info["video.channels"] = 1
+                    video_info["video.pix_fmt"] = "gray16le"
+                self.info["features"][key]["info"] = video_info
 
     def update_chunk_settings(
         self,
@@ -653,9 +680,9 @@ class LeRobotDatasetMetadata:
             data_files_size_in_mb,
             video_files_size_in_mb,
         )
-        if len(obj.video_keys) > 0 and not use_videos:
+        if len(obj.video_storage_keys) > 0 and not use_videos:
             raise ValueError(
-                f"Features contain video keys {obj.video_keys}, but 'use_videos' is set to False. "
+                f"Features contain video keys {obj.video_storage_keys}, but 'use_videos' is set to False. "
                 "Either remove video features from the features dict, or set 'use_videos=True'."
             )
         write_json(obj.info, obj.root / INFO_PATH)

@@ -493,6 +493,113 @@ def encode_video_frames(
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
 
 
+def _depth_frame_to_uint16_array(frame: str | Path | np.ndarray | Image.Image) -> np.ndarray:
+    if isinstance(frame, (str, Path)):
+        with Image.open(frame) as image:
+            array = np.asarray(image)
+    elif isinstance(frame, Image.Image):
+        array = np.asarray(frame)
+    else:
+        array = frame
+
+    if array.ndim == 3 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim != 2:
+        raise ValueError(f"Expected a single-channel depth frame, got shape {array.shape}.")
+    if array.dtype != np.uint16:
+        array = array.astype(np.uint16)
+    return np.ascontiguousarray(array)
+
+
+def encode_depth_video_frames(
+    frames: list[str | Path | np.ndarray | Image.Image],
+    video_path: Path | str,
+    fps: int,
+    log_level: int | None = av.logging.WARNING,
+    overwrite: bool = False,
+) -> None:
+    """Encode uint16 depth frames as lossless FFV1/Matroska gray16le video."""
+    video_path = Path(video_path)
+    if video_path.exists() and not overwrite:
+        logger.warning(f"Video file already exists: {video_path}. Skipping encoding.")
+        return
+    if len(frames) == 0:
+        raise FileNotFoundError("No depth frames provided.")
+
+    first_frame = _depth_frame_to_uint16_array(frames[0])
+    height, width = first_frame.shape
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if log_level is not None:
+        logging.getLogger("libav").setLevel(log_level)
+
+    with av.open(str(video_path), "w", format="matroska") as output:
+        output_stream = output.add_stream("ffv1", fps)
+        output_stream.pix_fmt = "gray16le"
+        output_stream.width = width
+        output_stream.height = height
+        output_stream.time_base = Fraction(1, fps)
+
+        for frame_idx, frame in enumerate(frames):
+            array = first_frame if frame_idx == 0 else _depth_frame_to_uint16_array(frame)
+            if array.shape != (height, width):
+                raise ValueError(
+                    f"Depth frame {frame_idx} has shape {array.shape}, expected {(height, width)}."
+                )
+            video_frame = av.VideoFrame.from_ndarray(array, format="gray16le")
+            video_frame.pts = frame_idx
+            video_frame.time_base = Fraction(1, fps)
+            for packet in output_stream.encode(video_frame):
+                output.mux(packet)
+
+        for packet in output_stream.encode():
+            output.mux(packet)
+
+    if log_level is not None:
+        av.logging.restore_default_callback()
+
+    if not video_path.exists():
+        raise OSError(f"Depth video encoding did not work. File not found: {video_path}.")
+
+
+def decode_depth_video_frames(
+    video_path: Path | str,
+    timestamps: list[float],
+    tolerance_s: float,
+) -> torch.Tensor:
+    """Decode lossless uint16 depth video frames without normalization."""
+    video_path = str(video_path)
+    loaded_frames = []
+    loaded_ts = []
+
+    with av.open(video_path, "r") as container:
+        stream = container.streams.video[0]
+        fps = float(stream.base_rate)
+        for frame_idx, frame in enumerate(container.decode(stream)):
+            timestamp = frame_idx / fps
+            loaded_frames.append(torch.from_numpy(frame.to_ndarray(format="gray16le").copy()).unsqueeze(0))
+            loaded_ts.append(timestamp)
+
+    if len(loaded_frames) == 0:
+        raise FrameTimestampError(f"No frames decoded from depth video: {video_path}")
+
+    query_ts = torch.tensor(timestamps)
+    loaded_ts_tensor = torch.tensor(loaded_ts)
+    dist = torch.cdist(query_ts[:, None], loaded_ts_tensor[:, None], p=1)
+    min_, argmin_ = dist.min(1)
+
+    is_within_tol = min_ < tolerance_s
+    if not is_within_tol.all():
+        raise FrameTimestampError(
+            f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
+            f"\nqueried timestamps: {query_ts}"
+            f"\nloaded timestamps: {loaded_ts_tensor}"
+            f"\nvideo: {video_path}"
+        )
+
+    return torch.stack([loaded_frames[idx] for idx in argmin_])
+
+
 def concatenate_video_files(
     input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
 ):
@@ -538,12 +645,11 @@ def concatenate_video_files(
         tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
     )  # safe = 0 allows absolute paths as well as relative paths
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+    with tempfile.NamedTemporaryFile(suffix=output_video_path.suffix, delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
-    output_container = av.open(
-        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
+    output_options = {"movflags": "faststart"} if output_video_path.suffix == ".mp4" else None
+    output_container = av.open(tmp_output_video_path, mode="w", options=output_options)
 
     # Replicate input streams in output container
     stream_map = {}
