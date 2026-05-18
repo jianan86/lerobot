@@ -818,11 +818,14 @@ class RobotClient:
             self._pose_act_history.append(frame)
 
         history = list(self._pose_act_history)
+        state_history = torch.stack(
+            [torch.as_tensor(history_frame[OBS_STATE], dtype=torch.float32) for history_frame in history],
+            dim=0,
+        )
         observation: RawObservation = {
-            OBS_STATE: torch.stack(
-                [torch.as_tensor(history_frame[OBS_STATE], dtype=torch.float32) for history_frame in history],
-                dim=0,
-            ),
+            # Keep cross-process observation payloads free of torch storages. Pickled torch tensors are not
+            # stable across the different PyTorch versions often used by the robot client and policy server.
+            OBS_STATE: state_history.cpu().numpy(),
             "task": task,
         }
         observation.update(
@@ -831,9 +834,8 @@ class RobotClient:
 
         for key in self.policy_config.lerobot_features:
             if key.startswith(f"{OBS_IMAGES}.") or key == POSE_ACT_DEPTH_KEY:
-                observation[key] = torch.stack(
-                    [torch.as_tensor(history_frame[key]) for history_frame in history], dim=0
-                )
+                image_history = torch.stack([torch.as_tensor(history_frame[key]) for history_frame in history], dim=0)
+                observation[key] = image_history.cpu().numpy()
 
         return observation
 
