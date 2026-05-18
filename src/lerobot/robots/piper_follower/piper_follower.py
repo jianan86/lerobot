@@ -57,9 +57,13 @@ class PiperFollower(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return {
+        features = {
             cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
         }
+        depth_rgb_cfg = self.config.cameras.get("depth_camera_rgb")
+        if depth_rgb_cfg is not None and getattr(depth_rgb_cfg, "use_depth", False):
+            features["depth_camera"] = (depth_rgb_cfg.height, depth_rgb_cfg.width, 1)
+        return features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -166,6 +170,13 @@ class PiperFollower(Robot):
             start = time.perf_counter()
             obs_dict[cam_key] = cam.read_latest()
             self.logs[f"read_camera_{cam_key}_dt_s"] = time.perf_counter() - start
+            if cam_key == "depth_camera_rgb" and getattr(cam, "use_depth", False):
+                start = time.perf_counter()
+                depth = cam.read_latest_depth()
+                if depth.ndim == 2:
+                    depth = depth[..., None]
+                obs_dict["depth_camera"] = depth
+                self.logs["read_camera_depth_camera_dt_s"] = time.perf_counter() - start
 
         return obs_dict
 

@@ -45,6 +45,11 @@ import numpy as np
 import torch
 
 from lerobot.policies import get_policy_class, make_pre_post_processors
+from lerobot.policies.pose_act.configuration_pose_act import (
+    POSE_ACT_DEPTH_CAMERA_RGB_KEY,
+    POSE_ACT_DEPTH_KEY,
+    POSE_ACT_FISHEYE_RGB_KEY,
+)
 from lerobot.policies.pose_act.utils import pose7d_to_pose10d, pose10d_to_pose7d
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.transport import (
@@ -205,7 +210,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return
         if frame is None:
             if not self._pose_act_vis_warned_no_image_history:
-                image_keys = [key for key in timed_observation.get_observation() if key.startswith("observation.images.")]
+                image_keys = [
+                    key
+                    for key in timed_observation.get_observation()
+                    if key.startswith("observation.images.")
+                ]
                 self.logger.warning(
                     "PoseACT visualization skipped: no two-frame image history found in observation. "
                     f"image_keys={image_keys}"
@@ -227,51 +236,55 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self._disable_pose_act_visualization(f"failed to enqueue visualization frame: {e}")
 
     def _build_pose_act_visualization_frame(self, raw_observation: dict[str, Any]) -> np.ndarray | None:
-        image_history = None
-        image_key = None
-        for key, value in raw_observation.items():
-            if key == OBS_STATE:
-                continue
-            if not key.startswith("observation.images."):
+        histories: list[tuple[str, np.ndarray]] = []
+        for key in (POSE_ACT_FISHEYE_RGB_KEY, POSE_ACT_DEPTH_CAMERA_RGB_KEY, POSE_ACT_DEPTH_KEY):
+            value = raw_observation.get(key)
+            if value is None:
                 continue
             array = np.asarray(value)
-            if array.ndim == 4 and array.shape[0] >= 2:
-                image_history = array
-                image_key = key
-                break
+            if array.ndim >= 3 and array.shape[0] >= 2:
+                histories.append((key, array))
 
-        if image_history is None:
+        if not histories:
+            for key, value in raw_observation.items():
+                if key == OBS_STATE or not key.startswith("observation.images."):
+                    continue
+                array = np.asarray(value)
+                if array.ndim == 4 and array.shape[0] >= 2:
+                    histories.append((key, array))
+                    break
+
+        if not histories:
             return None
-
-        frames = [
-            self._to_bgr_visualization_frame(image_history[0]),
-            self._to_bgr_visualization_frame(image_history[1]),
-        ]
-        height = max(frame.shape[0] for frame in frames)
-        padded = [self._pad_visualization_frame(frame, height) for frame in frames]
-        canvas = np.concatenate(padded, axis=1)
 
         import cv2
 
-        labels = ("t-1", "t0")
-        x_offset = 0
-        for label, frame in zip(labels, padded, strict=True):
+        rows = []
+        for key, history in histories:
+            frames = [
+                self._to_bgr_visualization_frame(history[0], is_depth=key == POSE_ACT_DEPTH_KEY),
+                self._to_bgr_visualization_frame(history[1], is_depth=key == POSE_ACT_DEPTH_KEY),
+            ]
+            height = max(frame.shape[0] for frame in frames)
+            padded = [self._pad_visualization_frame(frame, height) for frame in frames]
+            row = np.concatenate(padded, axis=1)
+            labels = ("t-1", "t0")
+            x_offset = 0
+            for label, frame in zip(labels, padded, strict=True):
+                cv2.putText(
+                    row,
+                    label,
+                    (x_offset + 12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+                x_offset += frame.shape[1]
             cv2.putText(
-                canvas,
-                label,
-                (x_offset + 12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-            x_offset += frame.shape[1]
-
-        if image_key is not None:
-            cv2.putText(
-                canvas,
-                image_key,
+                row,
+                key,
                 (12, max(48, height - 12)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -279,11 +292,18 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 1,
                 cv2.LINE_AA,
             )
+            rows.append(row)
+
+        width = max(row.shape[1] for row in rows)
+        rows = [self._pad_visualization_frame_width(row, width) for row in rows]
+        canvas = np.concatenate(rows, axis=0)
 
         return canvas
 
-    def _to_bgr_visualization_frame(self, frame: Any) -> np.ndarray:
+    def _to_bgr_visualization_frame(self, frame: Any, is_depth: bool = False) -> np.ndarray:
         image = np.asarray(frame)
+        if is_depth:
+            return self._depth_to_bgr_visualization_frame(image)
         if image.ndim != 3:
             raise ValueError(f"expected image ndim=3, got shape {tuple(image.shape)}")
         if image.shape[-1] == 1:
@@ -294,11 +314,39 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             image = np.clip(image, 0, 255).astype(np.uint8)
         return np.ascontiguousarray(image[..., ::-1])
 
+    def _depth_to_bgr_visualization_frame(self, frame: np.ndarray) -> np.ndarray:
+        if frame.ndim == 3 and frame.shape[-1] == 1:
+            frame = frame[..., 0]
+        if frame.ndim != 2:
+            raise ValueError(
+                f"expected depth ndim=2 or single-channel ndim=3, got shape {tuple(frame.shape)}"
+            )
+
+        finite = np.asarray(frame, dtype=np.float32)
+        valid = finite > 0
+        preview = np.zeros(finite.shape, dtype=np.uint8)
+        if np.any(valid):
+            near = float(np.percentile(finite[valid], 1))
+            far = float(np.percentile(finite[valid], 99))
+            if far <= near:
+                far = near + 1.0
+            preview = np.clip((finite - near) * 255.0 / (far - near), 0, 255).astype(np.uint8)
+
+        import cv2
+
+        return cv2.applyColorMap(preview, cv2.COLORMAP_TURBO)
+
     def _pad_visualization_frame(self, frame: np.ndarray, target_height: int) -> np.ndarray:
         if frame.shape[0] == target_height:
             return frame
         pad = target_height - frame.shape[0]
         return np.pad(frame, ((0, pad), (0, 0), (0, 0)), mode="constant", constant_values=0)
+
+    def _pad_visualization_frame_width(self, frame: np.ndarray, target_width: int) -> np.ndarray:
+        if frame.shape[1] == target_width:
+            return frame
+        pad = target_width - frame.shape[1]
+        return np.pad(frame, ((0, 0), (0, pad), (0, 0)), mode="constant", constant_values=0)
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()

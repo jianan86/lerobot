@@ -436,6 +436,30 @@ def test_pose_act_visualization_publish_overwrites_latest_frame():
     assert np.array_equal(queued, frame_b)
 
 
+def test_pose_act_visualization_builds_rgbd_history_frame():
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+    from lerobot.policies.pose_act.configuration_pose_act import POSE_ACT_DEPTH_KEY
+
+    server = PolicyServer(
+        PolicyServerConfig(host="localhost", port=9998, pose_act_visualize_observation=False)
+    )
+
+    frame = server._build_pose_act_visualization_frame(
+        {
+            "observation.images.fisheye_rgb": np.zeros((2, 8, 10, 3), dtype=np.uint8),
+            "observation.images.depth_camera_rgb": np.ones((2, 8, 10, 3), dtype=np.uint8),
+            POSE_ACT_DEPTH_KEY: np.full((2, 8, 10, 1), 1000, dtype=np.uint16),
+        }
+    )
+
+    assert frame is not None
+    assert frame.dtype == np.uint8
+    assert frame.shape[0] == 24
+    assert frame.shape[1] == 20
+    assert frame.shape[2] == 3
+
+
 def test_policy_server_config_validates_tensorrt_backend():
     from lerobot.async_inference.configs import PolicyServerConfig
 

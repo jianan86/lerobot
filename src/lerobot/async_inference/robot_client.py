@@ -837,12 +837,30 @@ class RobotClient:
 
         return observation
 
+    def _log_pose_act_payload_observation(self, observation: RawObservation) -> None:
+        entries = []
+        total_bytes = 0
+        for key, value in observation.items():
+            if not (key.startswith(f"{OBS_IMAGES}.") or key == POSE_ACT_DEPTH_KEY):
+                continue
+            tensor = torch.as_tensor(value)
+            payload_bytes = tensor.element_size() * tensor.nelement()
+            total_bytes += payload_bytes
+            entries.append(f"{key}: shape={tuple(tensor.shape)} dtype={tensor.dtype} bytes={payload_bytes}")
+
+        if entries:
+            self.logger.info(
+                "PoseACT RGBD observation payload "
+                f"total_bytes={total_bytes} keys={{" + "; ".join(entries) + "}"
+            )
+
     def _send_observation_request(self, request: ObservationRequest) -> RawObservation | None:
         try:
             start_time = time.perf_counter()
 
             if self._pose_act_adapter is not None:
                 raw_observation = self._build_pose_act_history_observation(request.task)
+                self._log_pose_act_payload_observation(raw_observation)
             else:
                 raw_observation = self.robot.get_observation()
                 raw_observation["task"] = request.task

@@ -19,6 +19,7 @@
 # pytest tests/cameras/test_opencv.py::test_connect
 # ```
 
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -200,6 +201,57 @@ def test_read_latest_too_old():
 
         with pytest.raises(TimeoutError):
             _ = camera.read_latest(max_age_ms=0)  # immediately too old
+
+
+def test_read_latest_depth_returns_uint16():
+    camera = RealSenseCamera.__new__(RealSenseCamera)
+    camera.rs_pipeline = object()
+    camera.rs_profile = object()
+    camera.serial_number = "042"
+    camera.use_depth = True
+    camera.thread = type("Thread", (), {"is_alive": lambda self: True})()
+    camera.frame_lock = type(
+        "Lock",
+        (),
+        {"__enter__": lambda self: None, "__exit__": lambda self, exc_type, exc, tb: None},
+    )()
+    camera.latest_depth_frame = np.ones((4, 5), dtype=np.uint16)
+    camera.latest_timestamp = time.perf_counter()
+
+    depth = camera.read_latest_depth()
+
+    assert depth.dtype == np.uint16
+    assert depth.shape == (4, 5)
+
+
+def test_read_latest_depth_requires_enabled_depth():
+    camera = RealSenseCamera.__new__(RealSenseCamera)
+    camera.rs_pipeline = object()
+    camera.rs_profile = object()
+    camera.serial_number = "042"
+    camera.use_depth = False
+
+    with pytest.raises(RuntimeError, match="Depth stream is not enabled"):
+        camera.read_latest_depth()
+
+
+def test_read_latest_depth_too_old():
+    camera = RealSenseCamera.__new__(RealSenseCamera)
+    camera.rs_pipeline = object()
+    camera.rs_profile = object()
+    camera.serial_number = "042"
+    camera.use_depth = True
+    camera.thread = type("Thread", (), {"is_alive": lambda self: True})()
+    camera.frame_lock = type(
+        "Lock",
+        (),
+        {"__enter__": lambda self: None, "__exit__": lambda self, exc_type, exc, tb: None},
+    )()
+    camera.latest_depth_frame = np.ones((4, 5), dtype=np.uint16)
+    camera.latest_timestamp = time.perf_counter() - 1.0
+
+    with pytest.raises(TimeoutError, match="latest depth frame is too old"):
+        camera.read_latest_depth(max_age_ms=1)
 
 
 @pytest.mark.parametrize(

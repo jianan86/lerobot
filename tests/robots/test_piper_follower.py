@@ -16,7 +16,9 @@
 
 import sys
 import types
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from lerobot.robots.piper_follower import PiperFollower, PiperFollowerConfig
@@ -128,6 +130,41 @@ def test_get_observation_converts_sdk_units(fake_piper_sdk):
 
     assert obs["joint_1.pos"] == 0
     assert obs["gripper.pos"] == 20_000 / MILLI_MM_PER_METER
+
+
+def test_get_observation_adds_depth_camera_from_depth_rgb_realsense(fake_piper_sdk, monkeypatch):
+    class FakeDepthCamera:
+        is_connected = True
+        use_depth = True
+
+        def read_latest(self):
+            return np.zeros((4, 5, 3), dtype=np.uint8)
+
+        def read_latest_depth(self):
+            return np.full((4, 5), 1000, dtype=np.uint16)
+
+        def connect(self):
+            pass
+
+    monkeypatch.setattr(
+        "lerobot.robots.piper_follower.piper_follower.make_cameras_from_configs",
+        lambda _configs: {"depth_camera_rgb": FakeDepthCamera()},
+    )
+    cfg = PiperFollowerConfig(
+        cameras={
+            "depth_camera_rgb": SimpleNamespace(height=4, width=5, fps=30, use_depth=True),
+        }
+    )
+    robot = PiperFollower(cfg)
+    robot.connect()
+
+    obs = robot.get_observation()
+
+    assert robot.observation_features["depth_camera_rgb"] == (4, 5, 3)
+    assert robot.observation_features["depth_camera"] == (4, 5, 1)
+    assert obs["depth_camera_rgb"].shape == (4, 5, 3)
+    assert obs["depth_camera"].shape == (4, 5, 1)
+    assert obs["depth_camera"].dtype == np.uint16
 
 
 def test_send_joint_delta_converts_to_sdk_units(fake_piper_sdk):

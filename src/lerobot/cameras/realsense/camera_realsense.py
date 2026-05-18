@@ -18,6 +18,7 @@ Provides the RealSenseCamera class for capturing frames from Intel RealSense cam
 
 import logging
 import time
+from contextlib import suppress
 from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any
 
@@ -139,6 +140,8 @@ class RealSenseCamera(Camera):
         self.latest_depth_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
         self.new_frame_event: Event = Event()
+        self._logged_color_stream_info = False
+        self._logged_depth_stream_info = False
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
 
@@ -478,11 +481,13 @@ class RealSenseCamera(Camera):
                 frame = self._read_from_hardware()
                 color_frame_raw = frame.get_color_frame()
                 color_frame = np.asanyarray(color_frame_raw.get_data())
+                self._log_stream_info_once("color", color_frame, color_frame_raw)
                 processed_color_frame = self._postprocess_image(color_frame)
 
                 if self.use_depth:
                     depth_frame_raw = frame.get_depth_frame()
                     depth_frame = np.asanyarray(depth_frame_raw.get_data())
+                    self._log_stream_info_once("depth", depth_frame, depth_frame_raw)
                     processed_depth_frame = self._postprocess_image(depth_frame, depth_frame=True)
 
                 capture_time = time.perf_counter()
@@ -503,6 +508,26 @@ class RealSenseCamera(Camera):
                     logger.warning(f"Error reading frame in background thread for {self}: {e}")
                 else:
                     raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
+
+    def _log_stream_info_once(self, stream_name: str, image: NDArray[Any], frame: Any) -> None:
+        attr = f"_logged_{stream_name}_stream_info"
+        if getattr(self, attr):
+            return
+
+        bits_per_pixel = image.dtype.itemsize * 8
+        try:
+            profile = frame.get_profile().as_video_stream_profile()
+            stream_label = profile.stream_name()
+            with suppress(Exception):
+                bits_per_pixel = int(profile.format().bits_per_pixel())
+        except Exception:
+            stream_label = stream_name
+
+        logger.info(
+            f"{self} {stream_name} stream={stream_label} "
+            f"shape={tuple(image.shape)} dtype={image.dtype} bit_depth={bits_per_pixel}"
+        )
+        setattr(self, attr, True)
 
     def _start_read_thread(self) -> None:
         """Starts or restarts the background read thread if it's not running."""
@@ -607,6 +632,32 @@ class RealSenseCamera(Camera):
                 f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
             )
 
+        return frame
+
+    @check_if_not_connected
+    def read_latest_depth(self, max_age_ms: int = 500) -> NDArray[Any]:
+        """Return the most recent depth frame captured by the background thread."""
+        if not self.use_depth:
+            raise RuntimeError(f"Depth stream is not enabled for {self}.")
+
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+
+        with self.frame_lock:
+            frame = self.latest_depth_frame
+            timestamp = self.latest_timestamp
+
+        if frame is None or timestamp is None:
+            raise RuntimeError(f"{self} has not captured any depth frames yet.")
+
+        age_ms = (time.perf_counter() - timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"{self} latest depth frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
+            )
+
+        if frame.dtype != np.uint16:
+            frame = frame.astype(np.uint16, copy=False)
         return frame
 
     def disconnect(self) -> None:
