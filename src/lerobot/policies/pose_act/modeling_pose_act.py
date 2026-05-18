@@ -23,12 +23,15 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
+from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.pose_act import ensure_pose10d, make_relative_state_history
 
 from ..act.modeling_act import ACT, ACTTemporalEnsembler
 from ..pretrained import PreTrainedPolicy
 from .configuration_pose_act import PoseACTConfig
+from .rgbd import fuse_pose_act_rgbd_observation
+
 
 class PoseACTPolicy(PreTrainedPolicy):
     """ACT-style policy over relative TCP pose chunks with observation history."""
@@ -42,6 +45,15 @@ class PoseACTPolicy(PreTrainedPolicy):
         self.config = config
 
         model_config = deepcopy(config)
+        if model_config.use_rgbd_inputs:
+            model_config.input_features = {
+                config.fisheye_rgb_key: deepcopy(config.input_features[config.fisheye_rgb_key]),
+                config.rgbd_fused_key: PolicyFeature(
+                    type=FeatureType.VISUAL,
+                    shape=(4, *config.input_features[config.depth_camera_rgb_key].shape[1:]),
+                ),
+                OBS_STATE: deepcopy(config.robot_state_feature),
+            }
         if model_config.robot_state_feature is not None:
             step_dim = 10
             model_config.input_features = dict(model_config.input_features or {})
@@ -97,6 +109,8 @@ class PoseACTPolicy(PreTrainedPolicy):
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         batch = self._move_batch_to_model_device(dict(batch))
+        if self.config.use_rgbd_inputs:
+            batch = fuse_pose_act_rgbd_observation(batch, self.config)
 
         state = batch[OBS_STATE]
         if state.ndim == 2:
@@ -112,13 +126,14 @@ class PoseACTPolicy(PreTrainedPolicy):
         batch[OBS_STATE] = state.flatten(start_dim=1)
 
         batch[OBS_IMAGES] = []
-        for key in self.config.image_features:
+        for key in self.config.model_image_feature_keys:
             images = batch[key]
             if images.ndim == 4:
                 images = images.unsqueeze(1)
             if images.shape[1] != self.config.n_obs_steps:
                 raise ValueError(
-                    f"pose_act expects {self.config.n_obs_steps} image steps for {key}, got {tuple(images.shape)}"
+                    f"pose_act expects {self.config.n_obs_steps} image steps for {key}, "
+                    f"got {tuple(images.shape)}"
                 )
             batch[OBS_IMAGES].extend(images[:, t] for t in range(self.config.n_obs_steps))
 
@@ -159,7 +174,9 @@ class PoseACTPolicy(PreTrainedPolicy):
             return self.temporal_ensembler.update(actions)
 
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(self._stack_queued_observations())[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(self._stack_queued_observations())[
+                :, : self.config.n_action_steps
+            ]
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 

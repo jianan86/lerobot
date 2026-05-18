@@ -51,6 +51,7 @@ import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.policies.pose_act.configuration_pose_act import POSE_ACT_DEPTH_KEY
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -58,20 +59,20 @@ from lerobot.robots import (  # noqa: F401
     koch_follower,
     make_robot_from_config,
     omx_follower,
+    piper_follower,  # noqa: F401
     so_follower,
 )
-from lerobot.robots import piper_follower  # noqa: F401
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
-from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+from lerobot.utils.import_utils import register_third_party_plugins
 
 from .adapters import POSE7D_NAMES, PoseActPiperAdapter, is_pose_act_piper
-from .configs import RobotClientConfig
 from .async_diagnostics import AsyncDiagnosticsWriter
+from .configs import RobotClientConfig
 from .helpers import (
     Action,
     FPSTracker,
@@ -182,11 +183,18 @@ class RobotClient:
         }
         for key, shape in self.robot.observation_features.items():
             if isinstance(shape, tuple):
-                features[f"{OBS_IMAGES}.{key}"] = {
-                    "dtype": "image",
-                    "shape": shape,
-                    "names": ["height", "width", "channels"],
-                }
+                if key == "depth_camera":
+                    features[POSE_ACT_DEPTH_KEY] = {
+                        "dtype": "depth_image",
+                        "shape": shape if len(shape) == 3 else (*shape, 1),
+                        "names": ["height", "width", "channels"],
+                    }
+                else:
+                    features[f"{OBS_IMAGES}.{key}"] = {
+                        "dtype": "image",
+                        "shape": shape,
+                        "names": ["height", "width", "channels"],
+                    }
         return features
 
     @property
@@ -796,7 +804,10 @@ class RobotClient:
 
         for key, shape in self.robot.observation_features.items():
             if isinstance(shape, tuple) and key in raw_observation:
-                frame[f"{OBS_IMAGES}.{key}"] = raw_observation[key]
+                if key == "depth_camera":
+                    frame[POSE_ACT_DEPTH_KEY] = raw_observation[key]
+                else:
+                    frame[f"{OBS_IMAGES}.{key}"] = raw_observation[key]
 
         return frame
 
@@ -809,7 +820,8 @@ class RobotClient:
         history = list(self._pose_act_history)
         observation: RawObservation = {
             OBS_STATE: torch.stack(
-                [torch.as_tensor(history_frame[OBS_STATE], dtype=torch.float32) for history_frame in history], dim=0
+                [torch.as_tensor(history_frame[OBS_STATE], dtype=torch.float32) for history_frame in history],
+                dim=0,
             ),
             "task": task,
         }
@@ -818,7 +830,7 @@ class RobotClient:
         )
 
         for key in self.policy_config.lerobot_features:
-            if key.startswith(f"{OBS_IMAGES}."):
+            if key.startswith(f"{OBS_IMAGES}.") or key == POSE_ACT_DEPTH_KEY:
                 observation[key] = torch.stack(
                     [torch.as_tensor(history_frame[key]) for history_frame in history], dim=0
                 )

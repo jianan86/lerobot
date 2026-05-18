@@ -521,6 +521,61 @@ def test_pose_act_piper_client_sends_previous_and_current_frames(monkeypatch):
     assert second_obs[image_key].shape[0] == 2
 
 
+def test_pose_act_piper_client_sends_rgbd_history(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.helpers import TimedObservation
+    from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.policies.pose_act.configuration_pose_act import POSE_ACT_DEPTH_KEY
+    from lerobot.robots.piper_follower import PiperFollowerConfig
+
+    class RgbdRobot(_StubPoseActPiperRobot):
+        def __init__(self):
+            super().__init__()
+            self.observation_features = {
+                "fisheye_rgb": (480, 640, 3),
+                "depth_camera_rgb": (480, 640, 3),
+                "depth_camera": (480, 640, 1),
+            }
+
+        def get_observation(self) -> dict[str, object]:
+            obs = {k: float(v) for k, v in self._joint_state.items()}
+            obs["fisheye_rgb"] = np.zeros((480, 640, 3), dtype=np.uint8)
+            obs["depth_camera_rgb"] = np.ones((480, 640, 3), dtype=np.uint8)
+            obs["depth_camera"] = np.full((480, 640, 1), 1000, dtype=np.uint16)
+            return obs
+
+    monkeypatch.setattr(
+        "lerobot.async_inference.robot_client.make_robot_from_config",
+        lambda config: RgbdRobot(),
+    )
+    client = RobotClient(
+        RobotClientConfig(
+            robot=PiperFollowerConfig(enable_on_connect=False, disable_on_disconnect=False),
+            server_address="localhost:9999",
+            policy_type="pose_act",
+            pretrained_name_or_path="test",
+            actions_per_chunk=3,
+        )
+    )
+    sent = []
+    monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or True)
+
+    try:
+        features = client.policy_config.lerobot_features
+        assert "observation.images.fisheye_rgb" in features
+        assert "observation.images.depth_camera_rgb" in features
+        assert features[POSE_ACT_DEPTH_KEY]["dtype"] == "depth_image"
+        client.control_loop_observation(task="test")
+    finally:
+        client.stop()
+
+    assert isinstance(sent[0], TimedObservation)
+    observation = sent[0].get_observation()
+    assert observation["observation.images.fisheye_rgb"].shape[0] == 2
+    assert observation["observation.images.depth_camera_rgb"].shape[0] == 2
+    assert observation[POSE_ACT_DEPTH_KEY].shape[0] == 2
+
+
 def test_async_observation_skips_busy_worker_without_warning_for_non_must_go(monkeypatch, caplog):
     client = _make_pose_act_piper_client(monkeypatch, async_observation=True)
     client.must_go.clear()

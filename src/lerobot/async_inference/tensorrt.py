@@ -52,6 +52,8 @@ class PoseACTTensorRTPolicyAdapter:
     ) -> None:
         if policy.name != "pose_act":
             raise ValueError(f"TensorRT backend currently supports only pose_act, got {policy.name!r}.")
+        if getattr(policy.config, "use_rgbd_inputs", False):
+            raise ValueError("TensorRT backend does not support pose_act RGBD inputs yet.")
         if policy.config.temporal_ensemble_coeff is not None:
             raise ValueError("TensorRT backend supports pose_act action chunks, not temporal ensembling.")
         if not torch.cuda.is_available():

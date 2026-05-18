@@ -309,6 +309,56 @@ class FrameTimestampError(ValueError):
 _default_decoder_cache = VideoDecoderCache()
 
 
+@dataclass
+class DepthVideoDecoder:
+    """Cached PyAV state for a depth video."""
+
+    container: Any
+    stream: Any
+    fps: float
+    next_frame_index: int | None = None
+    lock: Lock = field(default_factory=Lock)
+
+    def close(self) -> None:
+        self.container.close()
+
+
+class DepthVideoDecoderCache:
+    """Thread-safe cache for depth video containers."""
+
+    def __init__(self):
+        self._cache: dict[str, DepthVideoDecoder] = {}
+        self._lock = Lock()
+
+    def get_decoder(self, video_path: str) -> DepthVideoDecoder:
+        video_path = str(video_path)
+        with self._lock:
+            if video_path not in self._cache:
+                container = av.open(video_path, "r")
+                stream = container.streams.video[0]
+                fps_rate = stream.base_rate or stream.average_rate
+                if fps_rate is None:
+                    container.close()
+                    raise FrameTimestampError(f"Could not determine FPS for depth video: {video_path}")
+                self._cache[video_path] = DepthVideoDecoder(container, stream, float(fps_rate))
+            return self._cache[video_path]
+
+    def clear(self) -> None:
+        with self._lock:
+            for decoder in self._cache.values():
+                decoder.close()
+            self._cache.clear()
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+
+_default_depth_decoder_cache = DepthVideoDecoderCache()
+
+_MAX_DEPTH_FRAMES_WITHOUT_SEEK = 8
+
+
 def decode_video_frames_torchcodec(
     video_path: Path | str,
     timestamps: list[float],
@@ -566,25 +616,58 @@ def decode_depth_video_frames(
     video_path: Path | str,
     timestamps: list[float],
     tolerance_s: float,
+    decoder_cache: DepthVideoDecoderCache | None = None,
 ) -> torch.Tensor:
     """Decode lossless uint16 depth video frames without normalization."""
     video_path = str(video_path)
-    loaded_frames = []
-    loaded_ts = []
+    if decoder_cache is None:
+        decoder_cache = _default_depth_decoder_cache
 
-    with av.open(video_path, "r") as container:
-        stream = container.streams.video[0]
-        fps = float(stream.base_rate)
-        for frame_idx, frame in enumerate(container.decode(stream)):
-            timestamp = frame_idx / fps
-            loaded_frames.append(torch.from_numpy(frame.to_ndarray(format="gray16le").copy()).unsqueeze(0))
-            loaded_ts.append(timestamp)
+    decoder = decoder_cache.get_decoder(video_path)
+    target_indices = [round(ts * decoder.fps) for ts in timestamps]
+    unique_target_indices = sorted(set(target_indices))
+    if len(unique_target_indices) == 0:
+        raise FrameTimestampError(f"No timestamps provided for depth video: {video_path}")
+
+    loaded_frames: dict[int, torch.Tensor] = {}
+    loaded_ts: dict[int, float] = {}
+
+    with decoder.lock:
+        first_target_index = unique_target_indices[0]
+        can_decode_from_current_position = (
+            decoder.next_frame_index is not None
+            and first_target_index >= decoder.next_frame_index
+            and first_target_index - decoder.next_frame_index <= _MAX_DEPTH_FRAMES_WITHOUT_SEEK
+        )
+        if not can_decode_from_current_position:
+            start_ts = first_target_index / decoder.fps
+            seek_offset = int(round(start_ts / float(decoder.stream.time_base)))
+            decoder.container.seek(seek_offset, stream=decoder.stream, backward=True, any_frame=False)
+            decoder.next_frame_index = None
+
+        last_target_index = unique_target_indices[-1]
+        for frame in decoder.container.decode(decoder.stream):
+            if frame.pts is None:
+                raise FrameTimestampError(f"Depth video frame is missing pts: {video_path}")
+
+            timestamp = float(frame.pts * frame.time_base)
+            frame_index = round(timestamp * decoder.fps)
+            decoder.next_frame_index = frame_index + 1
+            if frame_index > last_target_index:
+                break
+            if frame_index in unique_target_indices and frame_index not in loaded_frames:
+                loaded_frames[frame_index] = torch.from_numpy(
+                    frame.to_ndarray(format="gray16le").copy()
+                ).unsqueeze(0)
+                loaded_ts[frame_index] = frame_index / decoder.fps
+                if len(loaded_frames) == len(unique_target_indices):
+                    break
 
     if len(loaded_frames) == 0:
         raise FrameTimestampError(f"No frames decoded from depth video: {video_path}")
 
     query_ts = torch.tensor(timestamps)
-    loaded_ts_tensor = torch.tensor(loaded_ts)
+    loaded_ts_tensor = torch.tensor([loaded_ts[idx] for idx in unique_target_indices if idx in loaded_ts])
     dist = torch.cdist(query_ts[:, None], loaded_ts_tensor[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
@@ -597,7 +680,8 @@ def decode_depth_video_frames(
             f"\nvideo: {video_path}"
         )
 
-    return torch.stack([loaded_frames[idx] for idx in argmin_])
+    loaded_frame_list = [loaded_frames[idx] for idx in unique_target_indices if idx in loaded_frames]
+    return torch.stack([loaded_frame_list[idx] for idx in argmin_])
 
 
 def concatenate_video_files(

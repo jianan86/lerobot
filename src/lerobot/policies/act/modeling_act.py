@@ -322,15 +322,31 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            if getattr(config, "use_rgbd_inputs", False):
+                fisheye_key = config.fisheye_rgb_key
+                rgbd_key = config.rgbd_fused_key
+                fisheye_backbone = self._make_resnet_backbone(config, in_channels=3)
+                rgbd_backbone = self._make_resnet_backbone(config, in_channels=4)
+                self.backbones = nn.ModuleDict(
+                    {
+                        "fisheye": IntermediateLayerGetter(
+                            fisheye_backbone, return_layers={"layer4": "feature_map"}
+                        ),
+                        "rgbd": IntermediateLayerGetter(
+                            rgbd_backbone, return_layers={"layer4": "feature_map"}
+                        ),
+                    }
+                )
+                self._image_backbone_names = {fisheye_key: "fisheye", rgbd_key: "rgbd"}
+                backbone_model = fisheye_backbone
+            else:
+                backbone_model = self._make_resnet_backbone(config, in_channels=3)
+                # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+                # feature map).
+                # Note: The forward method of this returns a dict: {"feature_map": output}.
+                self.backbone = IntermediateLayerGetter(
+                    backbone_model, return_layers={"layer4": "feature_map"}
+                )
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -369,6 +385,44 @@ class ACT(nn.Module):
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
         self._reset_parameters()
+
+    def _make_resnet_backbone(self, config: ACTConfig, in_channels: int):
+        backbone_model = getattr(torchvision.models, config.vision_backbone)(
+            replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+            weights=config.pretrained_backbone_weights,
+            norm_layer=FrozenBatchNorm2d,
+        )
+        if in_channels == 3:
+            return backbone_model
+
+        old_conv = backbone_model.conv1
+        new_conv = nn.Conv2d(
+            in_channels,
+            old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+        with torch.no_grad():
+            new_conv.weight[:, :3].copy_(old_conv.weight)
+            new_conv.weight[:, 3:].copy_(old_conv.weight.mean(dim=1, keepdim=True))
+            if old_conv.bias is not None:
+                new_conv.bias.copy_(old_conv.bias)
+        backbone_model.conv1 = new_conv
+        return backbone_model
+
+    def _image_feature_key(self, image_index: int) -> str:
+        image_keys = list(self.config.image_features)
+        steps_per_key = getattr(self.config, "n_obs_steps", 1)
+        return image_keys[image_index // steps_per_key]
+
+    def _encode_image_feature_map(self, img: Tensor, image_index: int) -> Tensor:
+        if getattr(self.config, "use_rgbd_inputs", False):
+            key = self._image_feature_key(image_index)
+            backbone_name = self._image_backbone_names[key]
+            return self.backbones[backbone_name](img)["feature_map"]
+        return self.backbone(img)["feature_map"]
 
     def _reset_parameters(self):
         """Xavier-uniform initialization of the transformer parameters as in the original code."""
@@ -470,8 +524,8 @@ class ACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
+            for image_index, img in enumerate(batch[OBS_IMAGES]):
+                cam_features = self._encode_image_feature_map(img, image_index)
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 

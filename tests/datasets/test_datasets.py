@@ -45,6 +45,8 @@ from lerobot.datasets.utils import (
 )
 from lerobot.datasets.video_utils import (
     VALID_VIDEO_CODECS,
+    DepthVideoDecoderCache,
+    _default_depth_decoder_cache,
     decode_depth_video_frames,
     encode_depth_video_frames,
 )
@@ -398,13 +400,52 @@ def test_depth_video_ffv1_matroska_roundtrip_preserves_uint16(tmp_path):
         frame = np.arange(20, dtype=np.uint16).reshape(4, 5) + np.uint16(idx * 1000)
         frame[2, 3] = np.uint16(12345 + idx)
         frames.append(frame)
+    cache = DepthVideoDecoderCache()
 
     encode_depth_video_frames(frames, video_path, fps=30, overwrite=True)
-    decoded = decode_depth_video_frames(video_path, [idx / 30 for idx in range(4)], tolerance_s=1e-4)
+    decoded = decode_depth_video_frames(
+        video_path, [idx / 30 for idx in range(4)], tolerance_s=1e-4, decoder_cache=cache
+    )
 
     for idx, expected in enumerate(frames):
         np.testing.assert_array_equal(decoded[idx].numpy()[0], expected)
     assert decoded[2, 0, 2, 3].item() == 12347
+    cache.clear()
+
+
+def test_depth_video_random_access_preserves_request_order(tmp_path):
+    video_path = tmp_path / "depth.mkv"
+    frames = []
+    for idx in range(8):
+        frames.append((np.arange(20, dtype=np.uint16).reshape(4, 5) + np.uint16(idx * 100)).copy())
+    cache = DepthVideoDecoderCache()
+
+    encode_depth_video_frames(frames, video_path, fps=30, overwrite=True)
+    decoded = decode_depth_video_frames(
+        video_path, [5 / 30, 1 / 30, 5 / 30, 7 / 30], tolerance_s=1e-4, decoder_cache=cache
+    )
+
+    assert decoded.dtype == torch.uint16
+    assert decoded.shape == torch.Size((4, 1, 4, 5))
+    np.testing.assert_array_equal(decoded[0].numpy()[0], frames[5])
+    np.testing.assert_array_equal(decoded[1].numpy()[0], frames[1])
+    np.testing.assert_array_equal(decoded[2].numpy()[0], frames[5])
+    np.testing.assert_array_equal(decoded[3].numpy()[0], frames[7])
+    cache.clear()
+
+
+def test_depth_video_decoder_cache_reuses_decoder(tmp_path):
+    video_path = tmp_path / "depth.mkv"
+    frames = [np.full((4, 5), idx, dtype=np.uint16) for idx in range(3)]
+    cache = DepthVideoDecoderCache()
+
+    encode_depth_video_frames(frames, video_path, fps=30, overwrite=True)
+    decode_depth_video_frames(video_path, [0 / 30], tolerance_s=1e-4, decoder_cache=cache)
+    decode_depth_video_frames(video_path, [2 / 30], tolerance_s=1e-4, decoder_cache=cache)
+
+    assert cache.size() == 1
+    cache.clear()
+    assert cache.size() == 0
 
 
 def test_add_frame_depth_video_path_preserves_uint16_mkv(tmp_path):
@@ -439,13 +480,16 @@ def test_add_frame_depth_video_path_preserves_uint16_mkv(tmp_path):
     assert dataset.meta.features["observation.depth.depth_camera"]["info"]["video.is_depth_map"] is True
     assert dataset.meta.features["observation.depth.depth_camera"]["info"]["video.pix_fmt"] == "gray16le"
 
-    item = dataset[1]
-    assert item["observation.depth.depth_camera"].dtype == torch.uint16
-    assert item["observation.depth.depth_camera"].shape == torch.Size((1, 3, 4))
-    torch.testing.assert_close(
-        item["observation.depth.depth_camera"],
-        torch.from_numpy(expected_depths[1][None, :, :]),
-    )
+    try:
+        item = dataset[1]
+        assert item["observation.depth.depth_camera"].dtype == torch.uint16
+        assert item["observation.depth.depth_camera"].shape == torch.Size((1, 3, 4))
+        torch.testing.assert_close(
+            item["observation.depth.depth_camera"],
+            torch.from_numpy(expected_depths[1][None, :, :]),
+        )
+    finally:
+        _default_depth_decoder_cache.clear()
 
 
 def test_set_image_transforms_applies_transparently(image_dataset):

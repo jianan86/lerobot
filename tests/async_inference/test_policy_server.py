@@ -334,6 +334,48 @@ def test_prepare_pose_act_observation_uses_client_history(monkeypatch):
     assert tuple(prepared["observation.images.fisheye_rgb"].shape) == (1, 2, 3, 16, 16)
 
 
+def test_prepare_pose_act_rgbd_observation_uses_depth_history(monkeypatch):
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+    from lerobot.policies.pose_act.configuration_pose_act import PoseACTConfig
+
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        use_rgbd_inputs=True,
+        input_features={
+            "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+            "observation.images.depth_camera_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+            "observation.depth.depth_camera": PolicyFeature(type=FeatureType.VISUAL, shape=(1, 16, 16)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+        },
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+    )
+
+    class PoseACTStub:
+        def __init__(self, cfg):
+            self.config = cfg
+
+    server = PolicyServer(PolicyServerConfig(host="localhost", port=9998))
+    server.policy_type = "pose_act"
+    server.policy = PoseACTStub(config)
+
+    observation = server._raw_pose_act_observation_to_observation(
+        {
+            OBS_STATE: torch.zeros(2, 7),
+            "observation.images.fisheye_rgb": torch.zeros(2, 20, 20, 3, dtype=torch.uint8),
+            "observation.images.depth_camera_rgb": torch.zeros(2, 20, 20, 3, dtype=torch.uint8),
+            "observation.depth.depth_camera": torch.full((2, 20, 20), 1000, dtype=torch.uint16),
+        }
+    )
+    prepared = server._prepare_pose_act_observation(observation)
+
+    assert tuple(prepared["observation.images.fisheye_rgb"].shape) == (1, 2, 3, 16, 16)
+    assert tuple(prepared["observation.images.depth_camera_rgb"].shape) == (1, 2, 3, 16, 16)
+    assert tuple(prepared["observation.depth.depth_camera"].shape) == (1, 2, 1, 16, 16)
+    assert prepared["observation.depth.depth_camera"].dtype == torch.float32
+
+
 def test_pose_act_result_dump(tmp_path):
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.helpers import TimedAction, TimedObservation
@@ -504,3 +546,31 @@ def test_pose_act_tensorrt_adapter_prepares_model_inputs():
 
     assert [tuple(tensor.shape) for tensor in inputs] == [(1, 20), (1, 3, 16, 16), (1, 3, 16, 16)]
     assert all(tensor.is_contiguous() for tensor in inputs)
+
+
+def test_pose_act_tensorrt_adapter_rejects_rgbd_inputs():
+    from lerobot.async_inference.tensorrt import PoseACTTensorRTPolicyAdapter
+    from lerobot.policies.pose_act.configuration_pose_act import PoseACTConfig
+    from lerobot.utils.constants import ACTION
+
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        use_rgbd_inputs=True,
+        input_features={
+            "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+            "observation.images.depth_camera_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+            "observation.depth.depth_camera": PolicyFeature(type=FeatureType.VISUAL, shape=(1, 16, 16)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+    )
+
+    class PoseACTStub:
+        name = "pose_act"
+
+        def __init__(self, cfg):
+            self.config = cfg
+
+    with pytest.raises(ValueError, match="RGBD"):
+        PoseACTTensorRTPolicyAdapter(PoseACTStub(config), engine_path="dummy.engine")

@@ -16,10 +16,14 @@
 
 from dataclasses import dataclass, field
 
-from lerobot.configs import NormalizationMode
-from lerobot.configs import PreTrainedConfig
+from lerobot.configs import NormalizationMode, PreTrainedConfig
 
 from ..act.configuration_act import ACTConfig
+
+POSE_ACT_FISHEYE_RGB_KEY = "observation.images.fisheye_rgb"
+POSE_ACT_DEPTH_CAMERA_RGB_KEY = "observation.images.depth_camera_rgb"
+POSE_ACT_DEPTH_KEY = "observation.depth.depth_camera"
+POSE_ACT_RGBD_FUSED_KEY = "observation.images.depth_camera_rgbd"
 
 
 @PreTrainedConfig.register_subclass("pose_act")
@@ -31,6 +35,14 @@ class PoseACTConfig(ACTConfig):
     img_obs_horizon: int = 2
     image_feature_key: str | None = None
     use_pose_normalization: bool = True
+    use_rgbd_inputs: bool = False
+    fisheye_rgb_key: str = POSE_ACT_FISHEYE_RGB_KEY
+    depth_camera_rgb_key: str = POSE_ACT_DEPTH_CAMERA_RGB_KEY
+    depth_key: str = POSE_ACT_DEPTH_KEY
+    rgbd_fused_key: str = POSE_ACT_RGBD_FUSED_KEY
+    depth_unit_scale: float = 0.001
+    depth_min_m: float = 0.1
+    depth_max_m: float = 5.0
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -60,10 +72,29 @@ class PoseACTConfig(ACTConfig):
             )
         if self.n_obs_steps < 1:
             raise ValueError(f"`n_obs_steps` must be >= 1. Got {self.n_obs_steps}.")
+        if self.depth_min_m >= self.depth_max_m:
+            raise ValueError(
+                "`depth_min_m` must be smaller than `depth_max_m`. "
+                f"Got {self.depth_min_m} and {self.depth_max_m}."
+            )
 
     def validate_features(self) -> None:
         if not self.image_features:
             raise ValueError("pose_act requires at least one image input.")
+        if self.use_rgbd_inputs:
+            missing = [
+                key
+                for key in (self.fisheye_rgb_key, self.depth_camera_rgb_key, self.depth_key)
+                if not self.input_features or key not in self.input_features
+            ]
+            if missing:
+                raise ValueError(f"pose_act RGBD mode requires input feature(s): {missing}.")
+            if self.input_features[self.fisheye_rgb_key].shape[0] != 3:
+                raise ValueError("pose_act RGBD mode expects fisheye RGB to have 3 channels.")
+            if self.input_features[self.depth_camera_rgb_key].shape[0] != 3:
+                raise ValueError("pose_act RGBD mode expects depth camera RGB to have 3 channels.")
+            if self.input_features[self.depth_key].shape[0] != 1:
+                raise ValueError("pose_act RGBD mode expects depth to have 1 channel.")
         if not self.robot_state_feature:
             raise ValueError("pose_act requires `observation.state` as TCP proprioception input.")
         if not self.action_feature:
@@ -87,3 +118,9 @@ class PoseACTConfig(ACTConfig):
     @property
     def observation_delta_indices(self) -> list[int]:
         return list(range(1 - self.n_obs_steps, 1))
+
+    @property
+    def model_image_feature_keys(self) -> list[str]:
+        if self.use_rgbd_inputs:
+            return [self.fisheye_rgb_key, self.rgbd_fused_key]
+        return list(self.image_features)

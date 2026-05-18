@@ -145,14 +145,17 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
     policy_features = {}
     for key, ft in features.items():
         shape = ft["shape"]
-        if ft["dtype"] in ["image", "video"]:
+        if ft["dtype"] in ["image", "video", "depth_image", "depth_video"]:
             type = FeatureType.VISUAL
             if len(shape) != 3:
                 raise ValueError(f"Number of dimensions of {key} != 3 (shape={shape})")
 
             names = ft["names"]
-            # Backward compatibility for "channel" which is an error introduced in LeRobotDataset v2.0 for ported datasets.
-            if names is not None and names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
+            # Backward compatibility for "channel", introduced by mistake in some v2.0 datasets.
+            if names is not None and (
+                (len(names) > 2 and names[2] in ["channel", "channels"])
+                or (ft["dtype"] in ["depth_image", "depth_video"] and names[0] in ["height", "width"])
+            ):  # (h, w, c) -> (c, h, w)
                 shape = (shape[2], shape[0], shape[1])
         elif key == OBS_ENV_STATE:
             type = FeatureType.ENV
@@ -185,6 +188,21 @@ def infer_policy_feature_sets(
             for key, ft in input_features.items()
             if key == OBS_STATE or ft.type is FeatureType.VISUAL
         }
+        if getattr(cfg, "use_rgbd_inputs", False):
+            required = [
+                cfg.fisheye_rgb_key,
+                cfg.depth_camera_rgb_key,
+                cfg.depth_key,
+            ]
+            missing = [key for key in required if key not in input_features]
+            if missing:
+                raise ValueError(
+                    f"pose_act RGBD mode requires dataset feature(s): {missing}. "
+                    f"Available features: {sorted(policy_features)}."
+                )
+            input_features = {
+                key: input_features[key] for key in [OBS_STATE, *required] if key in input_features
+            }
 
     image_feature_key = getattr(cfg, "image_feature_key", None)
     if image_feature_key is None:

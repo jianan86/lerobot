@@ -371,6 +371,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
 
         if self.config.inference_backend == "tensorrt":
+            if getattr(self.policy.config, "use_rgbd_inputs", False):
+                raise ValueError("TensorRT backend does not support pose_act RGBD inputs yet.")
             engine_path = Path(policy_specs.pretrained_name_or_path) / "model.engine"
             self.policy = PoseACTTensorRTPolicyAdapter(
                 self.policy,
@@ -704,7 +706,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         prepared: Observation = {OBS_STATE: pose7d_to_pose10d(state7d)}
         for key in self.policy.config.image_features:
-            image = observation[key].to(torch.float32)
+            image = observation[key]
             if image.ndim == 4:
                 image = image.unsqueeze(0)
             if image.ndim != 5 or image.shape[1] != self.policy.config.n_obs_steps:
@@ -712,10 +714,28 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     f"pose_act async expects image {key} shape (B,{self.policy.config.n_obs_steps},C,H,W), "
                     f"got {tuple(image.shape)}"
                 )
-            prepared[key] = image
+            prepared[key] = image.to(torch.float32)
         if "task" in observation:
             prepared["task"] = observation["task"]
         return prepared
+
+    def _resize_pose_act_depth_history(
+        self, depth_history: torch.Tensor, resize_shape: tuple[int, ...]
+    ) -> torch.Tensor:
+        if depth_history.ndim == 3:
+            depth_history = depth_history.unsqueeze(-1)
+        if depth_history.ndim != 4 or depth_history.shape[0] != self.policy.config.n_obs_steps:
+            raise ValueError(
+                f"pose_act async expects raw depth history {self.policy.config.depth_key} shape "
+                f"({self.policy.config.n_obs_steps},H,W) or ({self.policy.config.n_obs_steps},H,W,1), "
+                f"got {tuple(depth_history.shape)}"
+            )
+        if depth_history.shape[-1] != 1:
+            raise ValueError(f"pose_act async expects single-channel depth, got {tuple(depth_history.shape)}")
+
+        depth_chw = depth_history.permute(0, 3, 1, 2).to(torch.float32)
+        target_hw = (resize_shape[1], resize_shape[2])
+        return torch.nn.functional.interpolate(depth_chw, size=target_hw, mode="nearest")
 
     def _raw_pose_act_observation_to_observation(self, raw_observation: dict[str, Any]) -> Observation:
         observation: Observation = {
@@ -723,20 +743,27 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         }
         for key in self.policy.config.image_features:
             image_history = torch.as_tensor(raw_observation[key])
-            if image_history.ndim != 4 or image_history.shape[0] != self.policy.config.n_obs_steps:
-                raise ValueError(
-                    f"pose_act async expects raw image history {key} shape "
-                    f"({self.policy.config.n_obs_steps},H,W,C), got {tuple(image_history.shape)}"
+            if getattr(self.policy.config, "use_rgbd_inputs", False) and key == self.policy.config.depth_key:
+                resized = self._resize_pose_act_depth_history(
+                    image_history, self.policy.config.image_features[key].shape
                 )
-            resized = torch.stack(
-                [
-                    prepare_image(
-                        resize_robot_observation_image(image_history[t], self.policy.config.image_features[key].shape)
+            else:
+                if image_history.ndim != 4 or image_history.shape[0] != self.policy.config.n_obs_steps:
+                    raise ValueError(
+                        f"pose_act async expects raw image history {key} shape "
+                        f"({self.policy.config.n_obs_steps},H,W,C), got {tuple(image_history.shape)}"
                     )
-                    for t in range(self.policy.config.n_obs_steps)
-                ],
-                dim=0,
-            )
+                resized = torch.stack(
+                    [
+                        prepare_image(
+                            resize_robot_observation_image(
+                                image_history[t], self.policy.config.image_features[key].shape
+                            )
+                        )
+                        for t in range(self.policy.config.n_obs_steps)
+                    ],
+                    dim=0,
+                )
             observation[key] = resized
         if "task" in raw_observation:
             observation["task"] = raw_observation["task"]
