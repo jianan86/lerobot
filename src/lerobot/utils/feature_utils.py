@@ -188,7 +188,7 @@ def infer_policy_feature_sets(
             for key, ft in input_features.items()
             if key == OBS_STATE or ft.type is FeatureType.VISUAL
         }
-        if getattr(cfg, "use_rgbd_inputs", False):
+        if getattr(cfg, "use_rgbd_inputs", False) or getattr(cfg, "use_rgbd_v2_inputs", False):
             required = [
                 cfg.fisheye_rgb_key,
                 cfg.depth_camera_rgb_key,
@@ -196,8 +196,9 @@ def infer_policy_feature_sets(
             ]
             missing = [key for key in required if key not in input_features]
             if missing:
+                mode_name = "RGBD v2" if getattr(cfg, "use_rgbd_v2_inputs", False) else "RGBD"
                 raise ValueError(
-                    f"pose_act RGBD mode requires dataset feature(s): {missing}. "
+                    f"pose_act {mode_name} mode requires dataset feature(s): {missing}. "
                     f"Available features: {sorted(policy_features)}."
                 )
             input_features = {

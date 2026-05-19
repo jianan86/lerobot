@@ -45,7 +45,17 @@ class PoseACTPolicy(PreTrainedPolicy):
         self.config = config
 
         model_config = deepcopy(config)
-        if model_config.use_rgbd_inputs:
+        if model_config.use_rgbd_v2_inputs:
+            model_config.input_features = {
+                config.fisheye_rgb_key: deepcopy(config.input_features[config.fisheye_rgb_key]),
+                config.depth_camera_rgb_key: deepcopy(config.input_features[config.depth_camera_rgb_key]),
+                config.depth_mask_fused_key: PolicyFeature(
+                    type=FeatureType.VISUAL,
+                    shape=(2, *config.input_features[config.depth_key].shape[1:]),
+                ),
+                OBS_STATE: deepcopy(config.robot_state_feature),
+            }
+        elif model_config.use_rgbd_inputs:
             model_config.input_features = {
                 config.fisheye_rgb_key: deepcopy(config.input_features[config.fisheye_rgb_key]),
                 config.rgbd_fused_key: PolicyFeature(
@@ -76,14 +86,14 @@ class PoseACTPolicy(PreTrainedPolicy):
                 "params": [
                     p
                     for n, p in self.named_parameters()
-                    if not n.startswith("model.backbone") and p.requires_grad
+                    if not n.startswith(("model.backbone", "model.backbones")) and p.requires_grad
                 ]
             },
             {
                 "params": [
                     p
                     for n, p in self.named_parameters()
-                    if n.startswith("model.backbone") and p.requires_grad
+                    if n.startswith(("model.backbone", "model.backbones")) and p.requires_grad
                 ],
                 "lr": self.config.optimizer_lr_backbone,
             },
@@ -109,7 +119,7 @@ class PoseACTPolicy(PreTrainedPolicy):
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         batch = self._move_batch_to_model_device(dict(batch))
-        if self.config.use_rgbd_inputs:
+        if self.config.use_rgbd_inputs or self.config.use_rgbd_v2_inputs:
             batch = fuse_pose_act_rgbd_observation(batch, self.config)
 
         state = batch[OBS_STATE]

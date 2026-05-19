@@ -23,7 +23,9 @@ from ..act.configuration_act import ACTConfig
 POSE_ACT_FISHEYE_RGB_KEY = "observation.images.fisheye_rgb"
 POSE_ACT_DEPTH_CAMERA_RGB_KEY = "observation.images.depth_camera_rgb"
 POSE_ACT_DEPTH_KEY = "observation.depth.depth_camera"
+POSE_ACT_DEPTH_MASK_KEY = "observation.depth_mask.depth_camera"
 POSE_ACT_RGBD_FUSED_KEY = "observation.images.depth_camera_rgbd"
+POSE_ACT_DEPTH_MASK_FUSED_KEY = "observation.depth.depth_camera_with_mask"
 
 
 @PreTrainedConfig.register_subclass("pose_act")
@@ -36,10 +38,13 @@ class PoseACTConfig(ACTConfig):
     image_feature_key: str | None = None
     use_pose_normalization: bool = True
     use_rgbd_inputs: bool = False
+    use_rgbd_v2_inputs: bool = False
     fisheye_rgb_key: str = POSE_ACT_FISHEYE_RGB_KEY
     depth_camera_rgb_key: str = POSE_ACT_DEPTH_CAMERA_RGB_KEY
     depth_key: str = POSE_ACT_DEPTH_KEY
+    depth_mask_key: str = POSE_ACT_DEPTH_MASK_KEY
     rgbd_fused_key: str = POSE_ACT_RGBD_FUSED_KEY
+    depth_mask_fused_key: str = POSE_ACT_DEPTH_MASK_FUSED_KEY
     depth_unit_scale: float = 0.001
     depth_min_m: float = 0.1
     depth_max_m: float = 5.0
@@ -77,24 +82,28 @@ class PoseACTConfig(ACTConfig):
                 "`depth_min_m` must be smaller than `depth_max_m`. "
                 f"Got {self.depth_min_m} and {self.depth_max_m}."
             )
+        if self.use_rgbd_inputs and self.use_rgbd_v2_inputs:
+            raise ValueError("pose_act RGBD v1 and RGBD v2 input modes are mutually exclusive.")
 
     def validate_features(self) -> None:
         if not self.image_features:
             raise ValueError("pose_act requires at least one image input.")
-        if self.use_rgbd_inputs:
+        if self.use_rgbd_inputs or self.use_rgbd_v2_inputs:
+            required = [self.fisheye_rgb_key, self.depth_camera_rgb_key, self.depth_key]
+            mode_name = "RGBD v2" if self.use_rgbd_v2_inputs else "RGBD"
             missing = [
                 key
-                for key in (self.fisheye_rgb_key, self.depth_camera_rgb_key, self.depth_key)
+                for key in required
                 if not self.input_features or key not in self.input_features
             ]
             if missing:
-                raise ValueError(f"pose_act RGBD mode requires input feature(s): {missing}.")
+                raise ValueError(f"pose_act {mode_name} mode requires input feature(s): {missing}.")
             if self.input_features[self.fisheye_rgb_key].shape[0] != 3:
-                raise ValueError("pose_act RGBD mode expects fisheye RGB to have 3 channels.")
+                raise ValueError(f"pose_act {mode_name} mode expects fisheye RGB to have 3 channels.")
             if self.input_features[self.depth_camera_rgb_key].shape[0] != 3:
-                raise ValueError("pose_act RGBD mode expects depth camera RGB to have 3 channels.")
+                raise ValueError(f"pose_act {mode_name} mode expects depth camera RGB to have 3 channels.")
             if self.input_features[self.depth_key].shape[0] != 1:
-                raise ValueError("pose_act RGBD mode expects depth to have 1 channel.")
+                raise ValueError(f"pose_act {mode_name} mode expects depth to have 1 channel.")
         if not self.robot_state_feature:
             raise ValueError("pose_act requires `observation.state` as TCP proprioception input.")
         if not self.action_feature:
@@ -121,6 +130,8 @@ class PoseACTConfig(ACTConfig):
 
     @property
     def model_image_feature_keys(self) -> list[str]:
+        if self.use_rgbd_v2_inputs:
+            return [self.fisheye_rgb_key, self.depth_camera_rgb_key, self.depth_mask_fused_key]
         if self.use_rgbd_inputs:
             return [self.fisheye_rgb_key, self.rgbd_fused_key]
         return list(self.image_features)

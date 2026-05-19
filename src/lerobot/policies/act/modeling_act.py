@@ -322,7 +322,33 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            if getattr(config, "use_rgbd_inputs", False):
+            if getattr(config, "use_rgbd_v2_inputs", False):
+                fisheye_key = config.fisheye_rgb_key
+                depth_camera_key = config.depth_camera_rgb_key
+                depth_mask_key = config.depth_mask_fused_key
+                fisheye_backbone = self._make_resnet_backbone(config, in_channels=3)
+                depth_camera_backbone = self._make_resnet_backbone(config, in_channels=3)
+                depth_mask_backbone = self._make_resnet_backbone(config, in_channels=2)
+                self.backbones = nn.ModuleDict(
+                    {
+                        "fisheye": IntermediateLayerGetter(
+                            fisheye_backbone, return_layers={"layer4": "feature_map"}
+                        ),
+                        "depth_camera": IntermediateLayerGetter(
+                            depth_camera_backbone, return_layers={"layer4": "feature_map"}
+                        ),
+                        "depth_mask": IntermediateLayerGetter(
+                            depth_mask_backbone, return_layers={"layer4": "feature_map"}
+                        ),
+                    }
+                )
+                self._image_backbone_names = {
+                    fisheye_key: "fisheye",
+                    depth_camera_key: "depth_camera",
+                    depth_mask_key: "depth_mask",
+                }
+                backbone_model = fisheye_backbone
+            elif getattr(config, "use_rgbd_inputs", False):
                 fisheye_key = config.fisheye_rgb_key
                 rgbd_key = config.rgbd_fused_key
                 fisheye_backbone = self._make_resnet_backbone(config, in_channels=3)
@@ -405,8 +431,11 @@ class ACT(nn.Module):
             bias=old_conv.bias is not None,
         )
         with torch.no_grad():
-            new_conv.weight[:, :3].copy_(old_conv.weight)
-            new_conv.weight[:, 3:].copy_(old_conv.weight.mean(dim=1, keepdim=True))
+            if in_channels < 3:
+                new_conv.weight.copy_(old_conv.weight.mean(dim=1, keepdim=True).repeat(1, in_channels, 1, 1))
+            else:
+                new_conv.weight[:, :3].copy_(old_conv.weight)
+                new_conv.weight[:, 3:].copy_(old_conv.weight.mean(dim=1, keepdim=True))
             if old_conv.bias is not None:
                 new_conv.bias.copy_(old_conv.bias)
         backbone_model.conv1 = new_conv
@@ -418,7 +447,7 @@ class ACT(nn.Module):
         return image_keys[image_index // steps_per_key]
 
     def _encode_image_feature_map(self, img: Tensor, image_index: int) -> Tensor:
-        if getattr(self.config, "use_rgbd_inputs", False):
+        if getattr(self.config, "use_rgbd_inputs", False) or getattr(self.config, "use_rgbd_v2_inputs", False):
             key = self._image_feature_key(image_index)
             backbone_name = self._image_backbone_names[key]
             return self.backbones[backbone_name](img)["feature_map"]

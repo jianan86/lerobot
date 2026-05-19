@@ -26,9 +26,44 @@ def normalize_pose_act_rgb(rgb: Tensor) -> Tensor:
     return rgb.to(torch.float32)
 
 
+def normalize_pose_act_depth_mask(
+    depth: Tensor,
+    *,
+    unit_scale: float,
+    min_m: float,
+    max_m: float,
+) -> Tensor:
+    depth_m = depth.to(torch.float32) * unit_scale
+    valid_depth = torch.isfinite(depth_m) & (depth != 0) & (depth_m >= min_m) & (depth_m <= max_m)
+    return valid_depth.to(torch.float32)
+
+
 def fuse_pose_act_rgbd_observation(
     observation: dict[str, Tensor], config: PoseACTConfig
 ) -> dict[str, Tensor]:
+    if config.use_rgbd_v2_inputs:
+        if config.depth_mask_fused_key in observation:
+            return observation
+
+        fused = dict(observation)
+        depth = normalize_pose_act_depth(
+            fused[config.depth_key],
+            unit_scale=config.depth_unit_scale,
+            min_m=config.depth_min_m,
+            max_m=config.depth_max_m,
+        )
+        mask = normalize_pose_act_depth_mask(
+            fused[config.depth_key],
+            unit_scale=config.depth_unit_scale,
+            min_m=config.depth_min_m,
+            max_m=config.depth_max_m,
+        )
+        fused[config.fisheye_rgb_key] = normalize_pose_act_rgb(fused[config.fisheye_rgb_key])
+        fused[config.depth_camera_rgb_key] = normalize_pose_act_rgb(fused[config.depth_camera_rgb_key])
+        fused[config.depth_mask_key] = mask
+        fused[config.depth_mask_fused_key] = torch.cat([depth * mask, mask], dim=-3)
+        return fused
+
     if not config.use_rgbd_inputs or config.rgbd_fused_key in observation:
         return observation
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import pytest
 import torch
 
 from lerobot.configs.types import FeatureType, PolicyFeature
@@ -59,6 +60,54 @@ def test_pose_act_rgbd_forward_and_select_action():
         device="cpu",
         use_vae=False,
         use_rgbd_inputs=True,
+        chunk_size=4,
+        n_action_steps=2,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        input_features={
+            "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+            "observation.images.depth_camera_rgb": PolicyFeature(
+                type=FeatureType.VISUAL, shape=(3, 64, 64)
+            ),
+            "observation.depth.depth_camera": PolicyFeature(type=FeatureType.VISUAL, shape=(1, 64, 64)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+    )
+    policy = PoseACTPolicy(config)
+
+    train_batch = {
+        "observation.images.fisheye_rgb": torch.randint(0, 255, (2, 2, 3, 64, 64), dtype=torch.uint8),
+        "observation.images.depth_camera_rgb": torch.randint(0, 255, (2, 2, 3, 64, 64), dtype=torch.uint8),
+        "observation.depth.depth_camera": torch.full((2, 2, 1, 64, 64), 1000, dtype=torch.uint16),
+        OBS_STATE: torch.randn(2, 2, 10),
+        ACTION: torch.randn(2, 4, 10),
+        "action_is_pad": torch.zeros(2, 4, dtype=torch.bool),
+    }
+
+    loss, loss_dict = policy.forward(train_batch)
+    assert torch.isfinite(loss)
+    assert "l1_loss" in loss_dict
+
+    policy.reset()
+    infer_batch = {
+        "observation.images.fisheye_rgb": torch.zeros(1, 3, 64, 64, dtype=torch.uint8),
+        "observation.images.depth_camera_rgb": torch.zeros(1, 3, 64, 64, dtype=torch.uint8),
+        "observation.depth.depth_camera": torch.full((1, 1, 64, 64), 1000, dtype=torch.uint16),
+        OBS_STATE: torch.randn(1, 10),
+    }
+    action = policy.select_action(infer_batch)
+    assert action.shape == (1, 10)
+
+
+def test_pose_act_rgbd_v2_forward_and_select_action():
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        use_rgbd_v2_inputs=True,
         chunk_size=4,
         n_action_steps=2,
         dim_model=32,
@@ -233,3 +282,109 @@ def test_pose_act_rgbd_feature_inference_includes_depth():
         "observation.depth.depth_camera",
     }
     assert set(output_features) == {ACTION}
+
+
+def test_pose_act_rgbd_v2_feature_inference_includes_depth_without_depth_mask():
+    config = PoseACTConfig(device="cpu", use_vae=False, use_rgbd_v2_inputs=True)
+
+    input_features, output_features = infer_policy_feature_sets(
+        config,
+        {
+            "observation.images.fisheye_rgb": {
+                "dtype": "image",
+                "shape": (240, 320, 3),
+                "names": ["height", "width", "channel"],
+            },
+            "observation.images.depth_camera_rgb": {
+                "dtype": "image",
+                "shape": (240, 320, 3),
+                "names": ["height", "width", "channel"],
+            },
+            "observation.depth.depth_camera": {
+                "dtype": "depth_image",
+                "shape": (240, 320, 1),
+                "names": ["height", "width", "channel"],
+            },
+            OBS_STATE: {"dtype": "float32", "shape": (10,), "names": None},
+            ACTION: {"dtype": "float32", "shape": (10,), "names": None},
+        },
+    )
+
+    assert input_features["observation.depth.depth_camera"].shape == (1, 240, 320)
+    assert set(input_features) == {
+        OBS_STATE,
+        "observation.images.fisheye_rgb",
+        "observation.images.depth_camera_rgb",
+        "observation.depth.depth_camera",
+    }
+    assert set(output_features) == {ACTION}
+
+
+def test_pose_act_rgbd_v2_feature_inference_requires_depth():
+    config = PoseACTConfig(device="cpu", use_vae=False, use_rgbd_v2_inputs=True)
+
+    with pytest.raises(ValueError, match="depth_camera"):
+        infer_policy_feature_sets(
+            config,
+            {
+                "observation.images.fisheye_rgb": {
+                    "dtype": "image",
+                    "shape": (240, 320, 3),
+                    "names": ["height", "width", "channel"],
+                },
+                "observation.images.depth_camera_rgb": {
+                    "dtype": "image",
+                    "shape": (240, 320, 3),
+                    "names": ["height", "width", "channel"],
+                },
+                OBS_STATE: {"dtype": "float32", "shape": (10,), "names": None},
+                ACTION: {"dtype": "float32", "shape": (10,), "names": None},
+            },
+        )
+
+
+def test_pose_act_rejects_rgbd_v1_and_v2_together():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        PoseACTConfig(device="cpu", use_vae=False, use_rgbd_inputs=True, use_rgbd_v2_inputs=True)
+
+
+def test_pose_act_rgbd_v2_does_not_require_depth_mask_feature():
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        use_rgbd_v2_inputs=True,
+        input_features={
+            "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+            "observation.images.depth_camera_rgb": PolicyFeature(
+                type=FeatureType.VISUAL, shape=(3, 64, 64)
+            ),
+            "observation.depth.depth_camera": PolicyFeature(type=FeatureType.VISUAL, shape=(1, 64, 64)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+    )
+
+    PoseACTPolicy(config)
+
+
+def test_pose_act_rgbd_v2_requires_single_channel_depth():
+    base_features = {
+        "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+        "observation.images.depth_camera_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+        "observation.depth.depth_camera": PolicyFeature(type=FeatureType.VISUAL, shape=(1, 64, 64)),
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(10,))}
+
+    bad_depth = dict(base_features)
+    bad_depth["observation.depth.depth_camera"] = PolicyFeature(type=FeatureType.VISUAL, shape=(2, 64, 64))
+    with pytest.raises(ValueError, match="depth to have 1 channel"):
+        PoseACTPolicy(
+            PoseACTConfig(
+                device="cpu",
+                use_vae=False,
+                use_rgbd_v2_inputs=True,
+                input_features=bad_depth,
+                output_features=output_features,
+            )
+        )

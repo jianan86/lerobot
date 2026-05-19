@@ -122,3 +122,53 @@ def test_pose_act_processor_fuses_rgbd_inputs():
         (2, 1, 4, 4), (1.0 - config.depth_min_m) / (config.depth_max_m - config.depth_min_m)
     )
     torch.testing.assert_close(processed["observation.images.depth_camera_rgbd"][:, 3:], expected_depth)
+
+
+def test_pose_act_processor_fuses_rgbd_v2_inputs():
+    config = PoseACTConfig(
+        device="cpu",
+        use_vae=False,
+        use_rgbd_v2_inputs=True,
+        use_pose_normalization=False,
+        input_features={
+            "observation.images.fisheye_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 4, 4)),
+            "observation.images.depth_camera_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 4, 4)),
+            "observation.depth.depth_camera": PolicyFeature(type=FeatureType.VISUAL, shape=(1, 4, 4)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+    )
+    preprocessor, _ = make_pose_act_pre_post_processors(config, dataset_stats=None)
+
+    depth = torch.tensor(
+        [[[[1000, 1000, 0, 1000], [50, 1000, 1000, 1000], [1000, 6000, 1000, 1000], [1000, 1000, 1000, 1000]]]],
+        dtype=torch.uint16,
+    ).repeat(2, 1, 1, 1)
+    observation = {
+        OBS_STATE: torch.zeros(2, 10),
+        "observation.images.fisheye_rgb": torch.full((2, 3, 4, 4), 255, dtype=torch.uint8),
+        "observation.images.depth_camera_rgb": torch.full((2, 3, 4, 4), 128, dtype=torch.uint8),
+        "observation.depth.depth_camera": depth,
+    }
+
+    processed = preprocessor(transition_to_batch(create_transition(observation, None)))
+
+    assert processed["observation.images.fisheye_rgb"].dtype == torch.float32
+    torch.testing.assert_close(processed["observation.images.fisheye_rgb"], torch.ones(2, 3, 4, 4))
+    torch.testing.assert_close(
+        processed["observation.images.depth_camera_rgb"],
+        torch.full((2, 3, 4, 4), 128 / 255),
+    )
+    fused = processed["observation.depth.depth_camera_with_mask"]
+    assert fused.shape == (2, 2, 4, 4)
+    depth_m = depth.to(torch.float32) * config.depth_unit_scale
+    expected_mask = (
+        (depth != 0)
+        & (depth_m >= config.depth_min_m)
+        & (depth_m <= config.depth_max_m)
+    ).to(torch.float32)
+    expected_depth = (
+        depth_m.clamp(min=config.depth_min_m, max=config.depth_max_m) - config.depth_min_m
+    ) / (config.depth_max_m - config.depth_min_m)
+    torch.testing.assert_close(fused[:, :1], expected_depth * expected_mask)
+    torch.testing.assert_close(fused[:, 1:], expected_mask)

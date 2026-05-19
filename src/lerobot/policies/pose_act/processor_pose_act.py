@@ -52,7 +52,7 @@ from lerobot.utils.pose_act import (
 )
 
 from .configuration_pose_act import PoseACTConfig
-from .rgbd import normalize_pose_act_depth, normalize_pose_act_rgb
+from .rgbd import normalize_pose_act_depth, normalize_pose_act_depth_mask, normalize_pose_act_rgb
 
 
 def _as_pose10d_feature(feature: PolicyFeature) -> PolicyFeature:
@@ -120,7 +120,9 @@ class PoseActRgbdFusionProcessorStep(ProcessorStep):
     fisheye_rgb_key: str | None = None
     depth_camera_rgb_key: str | None = None
     depth_key: str | None = None
+    depth_mask_key: str | None = None
     rgbd_fused_key: str | None = None
+    depth_mask_fused_key: str | None = None
     depth_unit_scale: float | None = None
     depth_min_m: float | None = None
     depth_max_m: float | None = None
@@ -131,7 +133,9 @@ class PoseActRgbdFusionProcessorStep(ProcessorStep):
         self.fisheye_rgb_key = self.config.fisheye_rgb_key
         self.depth_camera_rgb_key = self.config.depth_camera_rgb_key
         self.depth_key = self.config.depth_key
+        self.depth_mask_key = self.config.depth_mask_key
         self.rgbd_fused_key = self.config.rgbd_fused_key
+        self.depth_mask_fused_key = self.config.depth_mask_fused_key
         self.depth_unit_scale = self.config.depth_unit_scale
         self.depth_min_m = self.config.depth_min_m
         self.depth_max_m = self.config.depth_max_m
@@ -142,7 +146,6 @@ class PoseActRgbdFusionProcessorStep(ProcessorStep):
             or self.fisheye_rgb_key is None
             or self.depth_camera_rgb_key is None
             or self.depth_key is None
-            or self.rgbd_fused_key is None
             or self.depth_unit_scale is None
             or self.depth_min_m is None
             or self.depth_max_m is None
@@ -154,7 +157,32 @@ class PoseActRgbdFusionProcessorStep(ProcessorStep):
             return transition
 
         fused = dict(observation)
-        if self.rgbd_fused_key not in fused:
+        if self.config is not None and self.config.use_rgbd_v2_inputs:
+            if (
+                self.depth_mask_fused_key is None
+                or self.depth_mask_fused_key in fused
+            ):
+                new_transition = transition.copy()
+                new_transition[TransitionKey.OBSERVATION] = fused
+                return new_transition
+            depth = normalize_pose_act_depth(
+                fused[self.depth_key],
+                unit_scale=self.depth_unit_scale,
+                min_m=self.depth_min_m,
+                max_m=self.depth_max_m,
+            )
+            mask = normalize_pose_act_depth_mask(
+                fused[self.depth_key],
+                unit_scale=self.depth_unit_scale,
+                min_m=self.depth_min_m,
+                max_m=self.depth_max_m,
+            )
+            fused[self.fisheye_rgb_key] = normalize_pose_act_rgb(fused[self.fisheye_rgb_key])
+            fused[self.depth_camera_rgb_key] = normalize_pose_act_rgb(fused[self.depth_camera_rgb_key])
+            if self.depth_mask_key is not None:
+                fused[self.depth_mask_key] = mask
+            fused[self.depth_mask_fused_key] = torch.cat([depth * mask, mask], dim=-3)
+        elif self.rgbd_fused_key is not None and self.rgbd_fused_key not in fused:
             rgb = normalize_pose_act_rgb(fused[self.depth_camera_rgb_key])
             depth = normalize_pose_act_depth(
                 fused[self.depth_key],
@@ -176,7 +204,9 @@ class PoseActRgbdFusionProcessorStep(ProcessorStep):
             "fisheye_rgb_key": self.fisheye_rgb_key,
             "depth_camera_rgb_key": self.depth_camera_rgb_key,
             "depth_key": self.depth_key,
+            "depth_mask_key": self.depth_mask_key,
             "rgbd_fused_key": self.rgbd_fused_key,
+            "depth_mask_fused_key": self.depth_mask_fused_key,
             "depth_unit_scale": self.depth_unit_scale,
             "depth_min_m": self.depth_min_m,
             "depth_max_m": self.depth_max_m,
@@ -188,11 +218,27 @@ class PoseActRgbdFusionProcessorStep(ProcessorStep):
         if (
             not self.enabled
             or self.depth_camera_rgb_key is None
-            or self.rgbd_fused_key is None
         ):
             return features
         observation_features = features.get(PipelineFeatureType.OBSERVATION)
-        if observation_features is not None and self.depth_camera_rgb_key in observation_features:
+        if (
+            self.config is not None
+            and self.config.use_rgbd_v2_inputs
+            and observation_features is not None
+            and self.depth_key is not None
+            and self.depth_mask_fused_key is not None
+            and self.depth_key in observation_features
+        ):
+            depth_shape = observation_features[self.depth_key].shape
+            observation_features[self.depth_mask_fused_key] = PolicyFeature(
+                type=FeatureType.VISUAL,
+                shape=(2, *depth_shape[1:]),
+            )
+        elif (
+            observation_features is not None
+            and self.rgbd_fused_key is not None
+            and self.depth_camera_rgb_key in observation_features
+        ):
             rgb_shape = observation_features[self.depth_camera_rgb_key].shape
             observation_features[self.rgbd_fused_key] = PolicyFeature(
                 type=FeatureType.VISUAL,
@@ -324,7 +370,16 @@ def make_pose_act_pre_post_processors(
 ]:
     relative_step = RelativePoseProcessorStep(enabled=True)
     absolute_step = AbsolutePoseActionProcessorStep(enabled=True, relative_step=relative_step)
-    if config.use_rgbd_inputs:
+    if config.use_rgbd_v2_inputs:
+        visual_features = {
+            config.fisheye_rgb_key: config.input_features[config.fisheye_rgb_key],
+            config.depth_camera_rgb_key: config.input_features[config.depth_camera_rgb_key],
+            config.depth_mask_fused_key: PolicyFeature(
+                type=FeatureType.VISUAL,
+                shape=(2, *config.input_features[config.depth_key].shape[1:]),
+            ),
+        }
+    elif config.use_rgbd_inputs:
         visual_features = {
             config.fisheye_rgb_key: config.input_features[config.fisheye_rgb_key],
             config.rgbd_fused_key: PolicyFeature(
@@ -342,7 +397,10 @@ def make_pose_act_pre_post_processors(
         AddBatchDimensionProcessorStep(),
         relative_step,
         DeviceProcessorStep(device=config.device),
-        PoseActRgbdFusionProcessorStep(enabled=config.use_rgbd_inputs, config=config),
+        PoseActRgbdFusionProcessorStep(
+            enabled=config.use_rgbd_inputs or config.use_rgbd_v2_inputs,
+            config=config,
+        ),
         PoseActUmiNormalizerProcessorStep(
             enabled=config.use_pose_normalization,
             stats=dataset_stats,

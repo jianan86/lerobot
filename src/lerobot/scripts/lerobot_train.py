@@ -292,7 +292,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         }
         # pose_act RGBD processors synthesize a float RGBD observation before normalization.
         # Keep the saved normalizer feature list so raw uint16 depth frames are not normalized directly.
-        if not (cfg.policy.type == "pose_act" and getattr(cfg.policy, "use_rgbd_inputs", False)):
+        if not (
+            cfg.policy.type == "pose_act"
+            and (getattr(cfg.policy, "use_rgbd_inputs", False) or getattr(cfg.policy, "use_rgbd_v2_inputs", False))
+        ):
             normalizer_overrides["features"] = {
                 **policy.config.input_features,
                 **policy.config.output_features,
