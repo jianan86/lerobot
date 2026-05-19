@@ -286,13 +286,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if processor_pretrained_path is not None:
+        normalizer_overrides = {
+            "stats": dataset.meta.stats,
+            "norm_map": policy.config.normalization_mapping,
+        }
+        # pose_act RGBD processors synthesize a float RGBD observation before normalization.
+        # Keep the saved normalizer feature list so raw uint16 depth frames are not normalized directly.
+        if not (cfg.policy.type == "pose_act" and getattr(cfg.policy, "use_rgbd_inputs", False)):
+            normalizer_overrides["features"] = {
+                **policy.config.input_features,
+                **policy.config.output_features,
+            }
+
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
-            "normalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": {**policy.config.input_features, **policy.config.output_features},
-                "norm_map": policy.config.normalization_mapping,
-            },
+            "normalizer_processor": normalizer_overrides,
         }
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
