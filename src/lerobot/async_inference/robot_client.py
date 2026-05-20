@@ -171,6 +171,8 @@ class RobotClient:
         )
         self._observation_worker_thread: threading.Thread | None = None
         self._observation_worker_busy = threading.Event()
+        self._observation_request_in_flight_lock = threading.Lock()
+        self._observation_request_in_flight_id: int | None = None
 
     def _pose_act_piper_lerobot_features(self) -> dict[str, dict]:
         """Feature contract for pose_act: pose7d state plus the robot cameras."""
@@ -398,6 +400,9 @@ class RobotClient:
         if self.config.aggregate_fn_name == "rtc_smooth":
             self._aggregate_action_queues_rtc_smooth(incoming_actions, receive_time=receive_time)
             return
+        if self.config.aggregate_fn_name == "smooth_opt":
+            self._aggregate_action_queues_smooth_opt(incoming_actions, receive_time=receive_time)
+            return
 
         if aggregate_fn is None:
             # default aggregate function: take the latest action
@@ -589,6 +594,166 @@ class RobotClient:
         with self.action_queue_lock:
             self.action_queue = future_action_queue
 
+    def _smooth_opt_solve_overlap(
+        self,
+        old_actions: list[TimedAction],
+        new_actions: list[TimedAction],
+        boundary_prev: torch.Tensor | None,
+    ) -> torch.Tensor:
+        old_stack = torch.stack([action.get_action() for action in old_actions])
+        new_stack = torch.stack([action.get_action() for action in new_actions])
+
+        solve_device = new_stack.device
+        out_dtype = new_stack.dtype
+        solve_dtype = torch.float64 if out_dtype == torch.float64 else torch.float32
+        old_flat = old_stack.to(device=solve_device, dtype=solve_dtype).flatten(start_dim=1)
+        new_flat = new_stack.to(device=solve_device, dtype=solve_dtype).flatten(start_dim=1)
+
+        overlap_steps = old_flat.shape[0]
+        progress = torch.arange(1, overlap_steps + 1, device=solve_device, dtype=solve_dtype)
+        progress = progress / (overlap_steps + 1)
+        new_weight = progress.pow(self.config.smooth_opt_new_weight_power)
+        old_weight = 1.0 - new_weight
+
+        matrix = torch.diag(old_weight + new_weight)
+        rhs = old_weight[:, None] * old_flat + new_weight[:, None] * new_flat
+
+        accel_weight = self.config.smooth_opt_accel_weight
+        if accel_weight > 0:
+            second_diff = torch.zeros(
+                (overlap_steps - 2, overlap_steps), device=solve_device, dtype=solve_dtype
+            )
+            for row in range(overlap_steps - 2):
+                second_diff[row, row : row + 3] = torch.tensor(
+                    [1.0, -2.0, 1.0], device=solve_device, dtype=solve_dtype
+                )
+            matrix = matrix + accel_weight * (second_diff.T @ second_diff)
+
+        boundary_weight = self.config.smooth_opt_boundary_velocity_weight
+        if boundary_prev is not None and boundary_weight > 0:
+            boundary = boundary_prev.to(device=solve_device, dtype=solve_dtype).flatten()
+            old_start = old_flat[0]
+            target_start = boundary + (old_start - boundary)
+            matrix[0, 0] = matrix[0, 0] + boundary_weight
+            rhs[0] = rhs[0] + boundary_weight * target_start
+
+        matrix = matrix + 1e-6 * torch.eye(overlap_steps, device=solve_device, dtype=solve_dtype)
+        optimized = torch.linalg.solve(matrix, rhs)
+        return optimized.reshape_as(new_stack).to(device=solve_device, dtype=out_dtype)
+
+    def _aggregate_action_queues_smooth_opt(
+        self,
+        incoming_actions: list[TimedAction],
+        receive_time: float | None = None,
+    ):
+        """Merge chunks by optimizing the old/new overlap trajectory."""
+        with self.latest_action_lock:
+            latest_action = self.latest_action
+        with self.action_queue_lock:
+            old_actions = list(self.action_queue.queue)
+
+        old_live = [action for action in old_actions if action.get_timestep() > latest_action]
+        incoming_live = [
+            action
+            for action in incoming_actions
+            if action.get_timestep() > latest_action
+            and (receive_time is None or action.get_timestamp() > receive_time)
+        ]
+
+        future_action_queue = Queue()
+        if not incoming_live:
+            for old_action in old_live:
+                future_action_queue.put(old_action)
+            with self.action_queue_lock:
+                self.action_queue = future_action_queue
+            return
+
+        safe_prefix_steps = self.config.rtc_smooth_safe_prefix_steps
+        blend_steps = self.config.rtc_smooth_blend_steps
+        incoming_first_step = incoming_live[0].get_timestep()
+        incoming_last_step = incoming_live[-1].get_timestep()
+
+        old_by_timestep = {action.get_timestep(): action for action in old_live}
+        incoming_by_timestep = {action.get_timestep(): action for action in incoming_live}
+        safe_prefix = old_live[:safe_prefix_steps]
+        safe_timesteps = {action.get_timestep() for action in safe_prefix}
+
+        overlap_new_actions: list[TimedAction] = []
+        overlap_old_actions: list[TimedAction] = []
+        for new_action in incoming_live:
+            timestep = new_action.get_timestep()
+            if timestep in safe_timesteps:
+                continue
+            old_action = old_by_timestep.get(timestep)
+            if old_action is None:
+                continue
+            if len(overlap_new_actions) >= blend_steps:
+                break
+            overlap_new_actions.append(new_action)
+            overlap_old_actions.append(old_action)
+
+        if len(overlap_new_actions) < 3:
+            self._aggregate_action_queues_rtc_smooth(incoming_actions, receive_time=receive_time)
+            return
+
+        output_by_timestep: dict[int, TimedAction] = {
+            action.get_timestep(): action for action in safe_prefix
+        }
+        first_overlap_timestep = overlap_new_actions[0].get_timestep()
+        previous_old_actions = [
+            action for action in old_live if action.get_timestep() < first_overlap_timestep
+        ]
+        boundary_prev = previous_old_actions[-1].get_action() if previous_old_actions else None
+
+        try:
+            optimized_overlap = self._smooth_opt_solve_overlap(
+                overlap_old_actions,
+                overlap_new_actions,
+                boundary_prev,
+            )
+        except RuntimeError as exc:
+            self.logger.warning("smooth_opt solve failed; falling back to rtc_smooth: %s", exc)
+            self._aggregate_action_queues_rtc_smooth(incoming_actions, receive_time=receive_time)
+            return
+
+        optimized_timesteps = {action.get_timestep() for action in overlap_new_actions}
+        for index, new_action in enumerate(overlap_new_actions):
+            timestep = new_action.get_timestep()
+            agg_tensor = optimized_overlap[index]
+            output_by_timestep[timestep] = TimedAction(
+                timestamp=new_action.get_timestamp(),
+                timestep=timestep,
+                action=agg_tensor,
+                request_id=new_action.request_id,
+            )
+            self._write_rtc_smooth_aggregate_event(
+                overlap_old_actions[index].get_action(),
+                new_action.get_action(),
+                agg_tensor,
+                new_action,
+                incoming_first_step,
+                incoming_last_step,
+            )
+
+        for new_action in incoming_live:
+            timestep = new_action.get_timestep()
+            if timestep in safe_timesteps or timestep in optimized_timesteps:
+                continue
+            output_by_timestep[timestep] = new_action
+
+        for old_action in old_live:
+            timestep = old_action.get_timestep()
+            if timestep in output_by_timestep or timestep in incoming_by_timestep:
+                continue
+            if timestep < incoming_first_step:
+                output_by_timestep[timestep] = old_action
+
+        for timestep in sorted(output_by_timestep):
+            future_action_queue.put(output_by_timestep[timestep])
+
+        with self.action_queue_lock:
+            self.action_queue = future_action_queue
+
     def receive_actions(self, verbose: bool = False):
         """Receive actions from the policy server"""
         # Wait at barrier for synchronized start
@@ -681,6 +846,7 @@ class RobotClient:
                         queue_update_ms=float(queue_update_time * 1000),
                     )
 
+                self._clear_observation_request_in_flight()
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
                 if verbose:
@@ -788,7 +954,32 @@ class RobotClient:
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
         with self.action_queue_lock:
-            return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+            below_threshold = self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+        if not below_threshold:
+            return False
+        return not (
+            self._single_flight_observation_requests() and self._has_observation_request_in_flight()
+        )
+
+    def _single_flight_observation_requests(self) -> bool:
+        return (
+            self._pose_act_adapter is not None
+            and self.config.observation_request_policy == "single_flight"
+        )
+
+    def _has_observation_request_in_flight(self) -> bool:
+        with self._observation_request_in_flight_lock:
+            return self._observation_request_in_flight_id is not None
+
+    def _mark_observation_request_in_flight(self, request_id: int) -> None:
+        if not self._single_flight_observation_requests():
+            return
+        with self._observation_request_in_flight_lock:
+            self._observation_request_in_flight_id = request_id
+
+    def _clear_observation_request_in_flight(self) -> None:
+        with self._observation_request_in_flight_lock:
+            self._observation_request_in_flight_id = None
 
     def _capture_pose_act_observation_frame(self, task: str) -> RawObservation:
         raw_observation: RawObservation = self.robot.get_observation()
@@ -878,6 +1069,8 @@ class RobotClient:
             raw_observation["async_loop_request_id"] = request.request_id
 
             sent = self.send_observation(observation)
+            if sent:
+                self._mark_observation_request_in_flight(request.request_id)
             if sent:
                 self.logger.info(
                     "Sent async observation request "

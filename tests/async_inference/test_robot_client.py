@@ -146,7 +146,11 @@ class _StubPoseActPiperRobot:
         return obs
 
 
-def _make_pose_act_piper_client(monkeypatch, async_observation: bool = False):
+def _make_pose_act_piper_client(
+    monkeypatch,
+    async_observation: bool = False,
+    observation_request_policy: str = "single_flight",
+):
     from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.async_inference.robot_client import RobotClient
     from lerobot.robots.piper_follower import PiperFollowerConfig
@@ -164,6 +168,7 @@ def _make_pose_act_piper_client(monkeypatch, async_observation: bool = False):
             pretrained_name_or_path="test",
             actions_per_chunk=3,
             async_observation=async_observation,
+            observation_request_policy=observation_request_policy,
         )
     )
 
@@ -256,20 +261,21 @@ def test_aggregate_action_queues_combines_actions_in_overlap(
     assert torch.allclose(queue_non_overlap_actions[0].get_action(), incoming[-1].get_action())
 
 
-def test_robot_client_config_accepts_rtc_smooth_aggregate_fn():
+def test_robot_client_config_accepts_context_aware_aggregate_fns():
     from lerobot.async_inference.configs import RobotClientConfig
     from tests.mocks.mock_robot import MockRobotConfig
 
-    cfg = RobotClientConfig(
-        robot=MockRobotConfig(),
-        server_address="localhost:9999",
-        policy_type="test",
-        pretrained_name_or_path="test",
-        actions_per_chunk=20,
-        aggregate_fn_name="rtc_smooth",
-    )
+    for aggregate_fn_name in ["rtc_smooth", "smooth_opt"]:
+        cfg = RobotClientConfig(
+            robot=MockRobotConfig(),
+            server_address="localhost:9999",
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            aggregate_fn_name=aggregate_fn_name,
+        )
 
-    assert cfg.aggregate_fn is None
+        assert cfg.aggregate_fn is None
 
 
 def test_robot_client_config_to_dict_includes_async_observation():
@@ -288,6 +294,44 @@ def test_robot_client_config_to_dict_includes_async_observation():
     assert cfg.to_dict()["async_observation"] is True
 
 
+def test_robot_client_config_to_dict_includes_observation_request_policy():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        observation_request_policy="threshold",
+    )
+
+    assert cfg.to_dict()["observation_request_policy"] == "threshold"
+
+
+def test_robot_client_config_to_dict_includes_smooth_opt_fields():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        aggregate_fn_name="smooth_opt",
+        smooth_opt_accel_weight=3.0,
+        smooth_opt_boundary_velocity_weight=4.0,
+        smooth_opt_new_weight_power=2.0,
+    )
+
+    cfg_dict = cfg.to_dict()
+    assert cfg_dict["smooth_opt_accel_weight"] == 3.0
+    assert cfg_dict["smooth_opt_boundary_velocity_weight"] == 4.0
+    assert cfg_dict["smooth_opt_new_weight_power"] == 2.0
+
+
 def test_robot_client_config_rejects_invalid_aggregate_fn():
     from lerobot.async_inference.configs import RobotClientConfig
     from tests.mocks.mock_robot import MockRobotConfig
@@ -300,6 +344,21 @@ def test_robot_client_config_rejects_invalid_aggregate_fn():
             pretrained_name_or_path="test",
             actions_per_chunk=20,
             aggregate_fn_name="unknown",
+        )
+
+
+def test_robot_client_config_rejects_invalid_observation_request_policy():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match="observation_request_policy"):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            server_address="localhost:9999",
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            observation_request_policy="unknown",
         )
 
 
@@ -328,6 +387,32 @@ def test_robot_client_config_rejects_invalid_rtc_smooth_steps():
             aggregate_fn_name="rtc_smooth",
             rtc_smooth_blend_steps=-1,
         )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("smooth_opt_accel_weight", -1.0),
+        ("smooth_opt_boundary_velocity_weight", -1.0),
+        ("smooth_opt_new_weight_power", 0.0),
+    ],
+)
+def test_robot_client_config_rejects_invalid_smooth_opt_weights(field: str, value: float):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    kwargs = {
+        "robot": MockRobotConfig(),
+        "server_address": "localhost:9999",
+        "policy_type": "test",
+        "pretrained_name_or_path": "test",
+        "actions_per_chunk": 20,
+        "aggregate_fn_name": "smooth_opt",
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match=field):
+        RobotClientConfig(**kwargs)
 
 
 def test_rtc_smooth_keeps_safe_prefix_blends_overlap_and_replaces_future(robot_client):
@@ -398,6 +483,95 @@ def test_rtc_smooth_single_overlap_blends_half_old_half_new(robot_client):
     assert values == pytest.approx([5.0])
 
 
+def test_smooth_opt_keeps_safe_prefix_optimizes_overlap_and_replaces_future(robot_client):
+    robot_client.config.aggregate_fn_name = "smooth_opt"
+    robot_client.config.rtc_smooth_safe_prefix_steps = 1
+    robot_client.config.rtc_smooth_blend_steps = 4
+    robot_client.config.smooth_opt_accel_weight = 4.0
+    robot_client.config.smooth_opt_boundary_velocity_weight = 2.0
+    robot_client.config.smooth_opt_new_weight_power = 1.0
+    robot_client.latest_action = 4
+
+    for action in _make_constant_actions(start_ts=100.0, start_t=5, values=[0, 0, 0, 0, 0]):
+        robot_client.action_queue.put(action)
+    incoming = _make_constant_actions(start_ts=101.0, start_t=5, values=[10, 10, 10, 10, 10, 10])
+
+    robot_client._aggregate_action_queues(incoming, receive_time=100.5)
+
+    timesteps, values = _queue_timesteps_and_values(robot_client.action_queue)
+    assert timesteps == [5, 6, 7, 8, 9, 10]
+    assert values[0] == pytest.approx(0.0)
+    assert values[-1] == pytest.approx(10.0)
+    assert values[1] < values[4]
+    assert values[4] > 5.0
+
+
+def test_smooth_opt_overlap_has_smaller_second_difference_than_direct_switch(robot_client):
+    robot_client.config.aggregate_fn_name = "smooth_opt"
+    robot_client.config.rtc_smooth_safe_prefix_steps = 1
+    robot_client.config.rtc_smooth_blend_steps = 5
+    robot_client.config.smooth_opt_accel_weight = 8.0
+    robot_client.config.smooth_opt_boundary_velocity_weight = 2.0
+    robot_client.config.smooth_opt_new_weight_power = 1.0
+    robot_client.latest_action = 4
+
+    old_values = [0, 0, 0, 0, 0, 0]
+    new_values = [10, -10, 10, -10, 10, -10, 10]
+    for action in _make_constant_actions(start_ts=100.0, start_t=5, values=old_values):
+        robot_client.action_queue.put(action)
+    incoming = _make_constant_actions(start_ts=101.0, start_t=5, values=new_values)
+
+    robot_client._aggregate_action_queues(incoming, receive_time=100.5)
+
+    _, values = _queue_timesteps_and_values(robot_client.action_queue)
+    optimized_overlap = torch.tensor(values[1:6])
+    direct_overlap = torch.tensor(new_values[1:6], dtype=torch.float32)
+    optimized_accel = torch.diff(optimized_overlap, n=2).abs().mean()
+    direct_accel = torch.diff(direct_overlap, n=2).abs().mean()
+    assert optimized_accel < direct_accel
+
+
+def test_smooth_opt_short_overlap_falls_back_to_rtc_smooth(robot_client):
+    robot_client.config.aggregate_fn_name = "smooth_opt"
+    robot_client.config.rtc_smooth_safe_prefix_steps = 0
+    robot_client.config.rtc_smooth_blend_steps = 2
+    robot_client.config.rtc_smooth_exp_schedule = False
+    robot_client.latest_action = 4
+
+    for action in _make_constant_actions(start_ts=100.0, start_t=5, values=[0, 0]):
+        robot_client.action_queue.put(action)
+    incoming = _make_constant_actions(start_ts=101.0, start_t=5, values=[10, 10, 10])
+
+    robot_client._aggregate_action_queues(incoming, receive_time=100.5)
+
+    timesteps, values = _queue_timesteps_and_values(robot_client.action_queue)
+    assert timesteps == [5, 6, 7]
+    assert values == pytest.approx([10 / 3, 20 / 3, 10.0])
+
+
+def test_smooth_opt_solve_failure_falls_back_to_rtc_smooth(robot_client, monkeypatch):
+    robot_client.config.aggregate_fn_name = "smooth_opt"
+    robot_client.config.rtc_smooth_safe_prefix_steps = 0
+    robot_client.config.rtc_smooth_blend_steps = 3
+    robot_client.config.rtc_smooth_exp_schedule = False
+    robot_client.latest_action = 4
+
+    for action in _make_constant_actions(start_ts=100.0, start_t=5, values=[0, 0, 0]):
+        robot_client.action_queue.put(action)
+    incoming = _make_constant_actions(start_ts=101.0, start_t=5, values=[10, 10, 10, 10])
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("singular")
+
+    monkeypatch.setattr(torch.linalg, "solve", _raise)
+
+    robot_client._aggregate_action_queues(incoming, receive_time=100.5)
+
+    timesteps, values = _queue_timesteps_and_values(robot_client.action_queue)
+    assert timesteps == [5, 6, 7, 8]
+    assert values == pytest.approx([2.5, 5.0, 7.5, 10.0])
+
+
 @pytest.mark.parametrize(
     "chunk_size, queue_len, expected",
     [
@@ -457,6 +631,69 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
         robot_client.action_queue.put(act)
 
     assert robot_client._ready_to_send_observation() is expected
+
+
+def test_pose_act_piper_single_flight_blocks_until_actions_return(monkeypatch):
+    client = _make_pose_act_piper_client(monkeypatch)
+    client.action_chunk_size = 3
+
+    try:
+        assert client._ready_to_send_observation() is True
+
+        client._mark_observation_request_in_flight(request_id=7)
+        assert client._ready_to_send_observation() is False
+
+        client._clear_observation_request_in_flight()
+        assert client._ready_to_send_observation() is True
+    finally:
+        client.stop()
+
+
+def test_pose_act_piper_threshold_policy_preserves_legacy_repeated_send(monkeypatch):
+    client = _make_pose_act_piper_client(monkeypatch, observation_request_policy="threshold")
+    client.action_chunk_size = 3
+
+    try:
+        with client._observation_request_in_flight_lock:
+            client._observation_request_in_flight_id = 7
+
+        assert client._ready_to_send_observation() is True
+    finally:
+        client.stop()
+
+
+def test_non_pose_act_piper_client_uses_threshold_policy(robot_client):
+    robot_client.action_chunk_size = 3
+    with robot_client._observation_request_in_flight_lock:
+        robot_client._observation_request_in_flight_id = 7
+
+    assert robot_client._ready_to_send_observation() is True
+
+
+def test_pose_act_piper_send_failure_does_not_mark_request_in_flight(monkeypatch):
+    client = _make_pose_act_piper_client(monkeypatch)
+    monkeypatch.setattr(client, "send_observation", lambda obs: False)
+
+    try:
+        request = client._make_observation_request("test", False)
+        client._send_observation_request(request)
+
+        assert client._has_observation_request_in_flight() is False
+    finally:
+        client.stop()
+
+
+def test_pose_act_piper_successful_send_marks_request_in_flight(monkeypatch):
+    client = _make_pose_act_piper_client(monkeypatch)
+    monkeypatch.setattr(client, "send_observation", lambda obs: True)
+
+    try:
+        request = client._make_observation_request("test", False)
+        client._send_observation_request(request)
+
+        assert client._has_observation_request_in_flight() is True
+    finally:
+        client.stop()
 
 
 def test_pose_act_piper_client_sends_pose7d_observation(monkeypatch):

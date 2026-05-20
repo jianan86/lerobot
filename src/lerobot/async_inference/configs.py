@@ -26,14 +26,15 @@ from .constants import (
     DEFAULT_OBS_QUEUE_TIMEOUT,
 )
 
-# Aggregate function registry for CLI usage. "rtc_smooth" is context-aware and
-# is handled directly by RobotClient instead of this pairwise registry.
+# Aggregate function registry for CLI usage. "rtc_smooth" and "smooth_opt" are context-aware and
+# are handled directly by RobotClient instead of this pairwise registry.
 AGGREGATE_FUNCTIONS = {
     "weighted_average": lambda old, new: 0.3 * old + 0.7 * new,
     "latest_only": lambda old, new: new,
     "average": lambda old, new: 0.5 * old + 0.5 * new,
     "conservative": lambda old, new: 0.7 * old + 0.3 * new,
     "rtc_smooth": None,
+    "smooth_opt": None,
 }
 
 
@@ -260,6 +261,14 @@ class RobotClientConfig:
             "does not block on observation I/O."
         },
     )
+    observation_request_policy: str = field(
+        default="single_flight",
+        metadata={
+            "help": "Client observation request scheduling policy. 'single_flight' keeps at most one "
+            "PoseACT Piper request in flight until an action chunk is received. 'threshold' preserves "
+            "the legacy chunk_size_threshold-only behavior."
+        },
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -277,6 +286,18 @@ class RobotClientConfig:
     rtc_smooth_exp_schedule: bool = field(
         default=True,
         metadata={"help": "For aggregate_fn_name=rtc_smooth, use an exponential old-action decay schedule."},
+    )
+    smooth_opt_accel_weight: float = field(
+        default=1.0,
+        metadata={"help": "For aggregate_fn_name=smooth_opt, weight for overlap second-difference smoothing."},
+    )
+    smooth_opt_boundary_velocity_weight: float = field(
+        default=2.0,
+        metadata={"help": "For aggregate_fn_name=smooth_opt, weight for overlap start velocity continuity."},
+    )
+    smooth_opt_new_weight_power: float = field(
+        default=1.0,
+        metadata={"help": "For aggregate_fn_name=smooth_opt, power for the old-to-new overlap weight ramp."},
     )
 
     # Debug configuration
@@ -328,6 +349,12 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.observation_request_policy not in {"single_flight", "threshold"}:
+            raise ValueError(
+                "observation_request_policy must be one of ['single_flight', 'threshold'], "
+                f"got {self.observation_request_policy!r}"
+            )
+
         if self.rtc_smooth_safe_prefix_steps < 0:
             raise ValueError(
                 "rtc_smooth_safe_prefix_steps must be non-negative, "
@@ -337,6 +364,22 @@ class RobotClientConfig:
         if self.rtc_smooth_blend_steps < 0:
             raise ValueError(
                 f"rtc_smooth_blend_steps must be non-negative, got {self.rtc_smooth_blend_steps}"
+            )
+
+        if self.smooth_opt_accel_weight < 0:
+            raise ValueError(
+                f"smooth_opt_accel_weight must be non-negative, got {self.smooth_opt_accel_weight}"
+            )
+
+        if self.smooth_opt_boundary_velocity_weight < 0:
+            raise ValueError(
+                "smooth_opt_boundary_velocity_weight must be non-negative, "
+                f"got {self.smooth_opt_boundary_velocity_weight}"
+            )
+
+        if self.smooth_opt_new_weight_power <= 0:
+            raise ValueError(
+                f"smooth_opt_new_weight_power must be positive, got {self.smooth_opt_new_weight_power}"
             )
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
@@ -367,6 +410,7 @@ class RobotClientConfig:
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
             "async_observation": self.async_observation,
+            "observation_request_policy": self.observation_request_policy,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
@@ -374,4 +418,7 @@ class RobotClientConfig:
             "rtc_smooth_safe_prefix_steps": self.rtc_smooth_safe_prefix_steps,
             "rtc_smooth_blend_steps": self.rtc_smooth_blend_steps,
             "rtc_smooth_exp_schedule": self.rtc_smooth_exp_schedule,
+            "smooth_opt_accel_weight": self.smooth_opt_accel_weight,
+            "smooth_opt_boundary_velocity_weight": self.smooth_opt_boundary_velocity_weight,
+            "smooth_opt_new_weight_power": self.smooth_opt_new_weight_power,
         }
