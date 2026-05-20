@@ -263,6 +263,7 @@ class RobotClient:
         self.logger.debug(f"Observation serialization time: {serialize_time:.6f}s")
 
         try:
+            send_start = time.perf_counter()
             observation_iterator = send_bytes_in_chunks(
                 observation_bytes,
                 services_pb2.Observation,
@@ -270,8 +271,20 @@ class RobotClient:
                 silent=True,
             )
             _ = self.stub.SendObservations(observation_iterator)
+            send_time = time.perf_counter() - send_start
             obs_timestep = obs.get_timestep()
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
+            if self._diagnostics.enabled:
+                raw_observation = obs.get_observation()
+                self._diagnostics.write_async_loop_event(
+                    "client_observation_sent",
+                    request_id=raw_observation.get("async_loop_request_id"),
+                    observation_timestep=int(obs_timestep),
+                    send_wallclock=float(obs.get_timestamp()),
+                    payload_bytes=int(len(observation_bytes)),
+                    serialize_ms=float(serialize_time * 1000),
+                    send_rpc_ms=float(send_time * 1000),
+                )
 
             return True
 

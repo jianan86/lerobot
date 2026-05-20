@@ -103,6 +103,11 @@ RGB_CAMERA_FEATURES = {
 DEPTH_CAMERA = "depth_camera"
 DEPTH_CAMERA_FEATURE = "observation.depth.depth_camera"
 SUPPORTED_CAMERAS = (*RGB_CAMERA_DIRS, DEPTH_CAMERA)
+AUTO_TRIM_EDGE_WINDOW_RATIO = 0.25
+AUTO_TRIM_EDGE_WINDOW_MIN_SAMPLES = 6
+AUTO_TRIM_MAX_CLOSED_RUN_SECONDS = 0.45
+AUTO_TRIM_MAX_CLOSED_RUN_SAMPLES = 3
+AUTO_TRIM_MAX_GAP_SECONDS = 0.75
 
 
 def load_synced_files(directory: Path) -> list[Path]:
@@ -149,6 +154,26 @@ def load_gripper_json(path: Path) -> np.ndarray:
 
     values = [payload["angle"], payload["distance"]]
     return np.asarray(values, dtype=np.float32)
+
+
+def _timestamp_from_path(path: Path) -> float:
+    try:
+        return float(path.stem)
+    except ValueError as exc:
+        raise ValueError(f"File name must start with a numeric timestamp: {path.name}") from exc
+
+
+def load_gripper_timeseries(gripper_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    if not gripper_dir.exists():
+        raise FileNotFoundError(f"Required modality directory not found: {gripper_dir}")
+
+    files = sorted(gripper_dir.glob("*.json"), key=_timestamp_from_path)
+    if not files:
+        files = load_synced_files(gripper_dir)
+
+    timestamps = np.asarray([_timestamp_from_path(path) for path in files], dtype=np.float64)
+    distances = np.asarray([load_gripper_json(path)[1] for path in files], dtype=np.float32)
+    return timestamps, distances
 
 
 def _rotation_about_axis(axis: str, angle: float) -> np.ndarray:
@@ -504,6 +529,108 @@ def resolve_frame_slice(
     return start_idx, end_idx
 
 
+def _closed_runs(closed: np.ndarray) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for idx, is_closed in enumerate(closed):
+        if bool(is_closed) and start is None:
+            start = idx
+        elif not bool(is_closed) and start is not None:
+            runs.append((start, idx))
+            start = None
+    if start is not None:
+        runs.append((start, len(closed)))
+    return runs
+
+
+def _is_short_closed_run(timestamps: np.ndarray, start: int, end: int) -> bool:
+    sample_count = end - start
+    duration = float(timestamps[end - 1] - timestamps[start]) if sample_count > 1 else 0.0
+    return sample_count <= AUTO_TRIM_MAX_CLOSED_RUN_SAMPLES or duration <= AUTO_TRIM_MAX_CLOSED_RUN_SECONDS
+
+
+def _find_double_close_marker(
+    timestamps: np.ndarray,
+    closed: np.ndarray,
+    *,
+    at_start: bool,
+) -> tuple[float, float] | None:
+    runs = _closed_runs(closed)
+    if len(runs) < 2:
+        return None
+
+    window_samples = min(
+        len(closed),
+        max(AUTO_TRIM_EDGE_WINDOW_MIN_SAMPLES, math.ceil(len(closed) * AUTO_TRIM_EDGE_WINDOW_RATIO)),
+    )
+    if at_start:
+        candidate_runs = [(start, end) for start, end in runs if start < window_samples]
+        pairs = zip(candidate_runs, candidate_runs[1:], strict=False)
+    else:
+        window_start = len(closed) - window_samples
+        candidate_runs = [(start, end) for start, end in runs if end > window_start]
+        pairs = reversed(list(zip(candidate_runs, candidate_runs[1:], strict=False)))
+
+    for first, second in pairs:
+        first_start, first_end = first
+        second_start, second_end = second
+        if not _is_short_closed_run(timestamps, first_start, first_end):
+            continue
+        if not _is_short_closed_run(timestamps, second_start, second_end):
+            continue
+        gap = float(timestamps[second_start] - timestamps[first_end - 1])
+        if gap <= AUTO_TRIM_MAX_GAP_SECONDS:
+            return float(timestamps[first_start]), float(timestamps[second_end - 1])
+    return None
+
+
+def resolve_auto_trim_frame_slice(
+    input_episode: Path,
+    synced_gripper_files: list[Path],
+    source_frame_start: int,
+    source_frame_end: int,
+) -> tuple[int, int, bool, bool]:
+    synced_timestamps = np.asarray([_timestamp_from_path(path) for path in synced_gripper_files], dtype=np.float64)
+    selected_start_time = synced_timestamps[source_frame_start]
+    selected_end_time = synced_timestamps[source_frame_end - 1]
+    all_timestamps, all_distances = load_gripper_timeseries(input_episode / GRIPPER_DIR)
+    in_selected_time = (selected_start_time <= all_timestamps) & (all_timestamps <= selected_end_time)
+    timestamps = all_timestamps[in_selected_time]
+    distances = all_distances[in_selected_time]
+    if len(timestamps) < 2:
+        return source_frame_start, source_frame_end, False, False
+
+    min_distance = float(np.min(distances))
+    p95_distance = float(np.percentile(distances, 95))
+    closed_threshold = min_distance + 0.25 * (p95_distance - min_distance)
+    closed = distances <= closed_threshold
+
+    start_marker = _find_double_close_marker(timestamps, closed, at_start=True)
+    end_marker = _find_double_close_marker(timestamps, closed, at_start=False)
+
+    trimmed_start = source_frame_start
+    trimmed_end = source_frame_end
+    if start_marker is not None:
+        _, marker_end_time = start_marker
+        if selected_start_time <= marker_end_time < selected_end_time:
+            trimmed_start = int(np.searchsorted(synced_timestamps, marker_end_time, side="right"))
+    if end_marker is not None:
+        marker_start_time, _ = end_marker
+        if selected_start_time < marker_start_time <= selected_end_time:
+            trimmed_end = int(np.searchsorted(synced_timestamps, marker_start_time, side="left"))
+
+    if trimmed_end <= trimmed_start:
+        logging.warning(
+            "Auto-trim markers for %s would select no frames; keeping original source frame range [%s, %s)",
+            input_episode,
+            source_frame_start,
+            source_frame_end,
+        )
+        return source_frame_start, source_frame_end, start_marker is not None, end_marker is not None
+
+    return trimmed_start, trimmed_end, start_marker is not None, end_marker is not None
+
+
 def add_episode_to_dataset(
     dataset: Any,
     input_episode: Path,
@@ -514,13 +641,30 @@ def add_episode_to_dataset(
     smooth_pika_pose: bool = False,
     smooth_pika_pose_alpha: float = 0.25,
     smooth_pika_pose_mode: str = "causal",
+    auto_trim: bool = False,
+    auto_trim_min_keep_ratio: float = 0.5,
 ) -> dict[str, Any]:
     input_episode = Path(input_episode)
     selected_cameras = parse_cameras(cameras)
     modality_files = discover_episode_files(input_episode, cameras=selected_cameras)
     aligned_length = compute_aligned_length(modality_files)
     source_frame_start, source_frame_end = resolve_frame_slice(aligned_length, frame_range)
+    source_frame_start_before_auto_trim = source_frame_start
+    source_frame_end_before_auto_trim = source_frame_end
+    auto_trim_start_marker_found = False
+    auto_trim_end_marker_found = False
+    if auto_trim:
+        source_frame_start, source_frame_end, auto_trim_start_marker_found, auto_trim_end_marker_found = (
+            resolve_auto_trim_frame_slice(
+                input_episode,
+                modality_files["gripper"],
+                source_frame_start,
+                source_frame_end,
+            )
+        )
+    available_frame_count = source_frame_end_before_auto_trim - source_frame_start_before_auto_trim
     selected_frame_count = source_frame_end - source_frame_start
+    auto_trim_keep_ratio = selected_frame_count / available_frame_count
     parsed_frame_range = parse_frame_range(frame_range)
     task_text = get_episode_task(input_episode / "instructions.json", task_override=task)
 
@@ -530,7 +674,21 @@ def add_episode_to_dataset(
         {name: len(files) for name, files in modality_files.items()},
     )
     logging.info("Using aligned frame count: %s", aligned_length)
-    logging.info("Using source frame range: [%s, %s)", source_frame_start, source_frame_end)
+    logging.info(
+        "Using source frame range: [%s, %s); kept %s/%s selected frames (%.1f%%)",
+        source_frame_start,
+        source_frame_end,
+        selected_frame_count,
+        available_frame_count,
+        100.0 * auto_trim_keep_ratio,
+    )
+    if auto_trim and auto_trim_keep_ratio < auto_trim_min_keep_ratio:
+        logging.warning(
+            "Auto-trim for %s kept %.1f%% of selected frames, below minimum %.1f%%",
+            input_episode,
+            100.0 * auto_trim_keep_ratio,
+            100.0 * auto_trim_min_keep_ratio,
+        )
 
     states = np.stack(
         [
@@ -572,6 +730,12 @@ def add_episode_to_dataset(
         "task": task_text,
         "cameras": selected_cameras,
         "camera_storage": camera_storage,
+        "auto_trim": auto_trim,
+        "auto_trim_keep_ratio": auto_trim_keep_ratio,
+        "auto_trim_source_frame_start_before": source_frame_start_before_auto_trim,
+        "auto_trim_source_frame_end_before": source_frame_end_before_auto_trim,
+        "auto_trim_start_marker_found": auto_trim_start_marker_found,
+        "auto_trim_end_marker_found": auto_trim_end_marker_found,
         "smooth_pika_pose": smooth_pika_pose,
         "smooth_pika_pose_alpha": float(smooth_pika_pose_alpha),
         "smooth_pika_pose_mode": smooth_pika_pose_mode,
@@ -592,6 +756,8 @@ def convert_episode(
     smooth_pika_pose: bool = False,
     smooth_pika_pose_alpha: float = 0.25,
     smooth_pika_pose_mode: str = "causal",
+    auto_trim: bool = False,
+    auto_trim_min_keep_ratio: float = 0.5,
     vcodec: str = DEFAULT_VIDEO_CODEC,
     streaming_encoding: bool | None = None,
 ) -> dict[str, Any]:
@@ -631,6 +797,8 @@ def convert_episode(
             smooth_pika_pose=smooth_pika_pose,
             smooth_pika_pose_alpha=smooth_pika_pose_alpha,
             smooth_pika_pose_mode=smooth_pika_pose_mode,
+            auto_trim=auto_trim,
+            auto_trim_min_keep_ratio=auto_trim_min_keep_ratio,
         )
         dataset.finalize()
     except Exception:
@@ -674,6 +842,8 @@ def convert_episodes(
     smooth_pika_pose: bool = False,
     smooth_pika_pose_alpha: float = 0.25,
     smooth_pika_pose_mode: str = "causal",
+    auto_trim: bool = False,
+    auto_trim_min_keep_ratio: float = 0.5,
     vcodec: str = DEFAULT_VIDEO_CODEC,
     streaming_encoding: bool | None = None,
 ) -> dict[str, Any]:
@@ -718,6 +888,8 @@ def convert_episodes(
                     smooth_pika_pose=smooth_pika_pose,
                     smooth_pika_pose_alpha=smooth_pika_pose_alpha,
                     smooth_pika_pose_mode=smooth_pika_pose_mode,
+                    auto_trim=auto_trim,
+                    auto_trim_min_keep_ratio=auto_trim_min_keep_ratio,
                 )
             )
         dataset.finalize()
@@ -739,6 +911,8 @@ def convert_episodes(
         "smooth_pika_pose": smooth_pika_pose,
         "smooth_pika_pose_alpha": float(smooth_pika_pose_alpha),
         "smooth_pika_pose_mode": smooth_pika_pose_mode,
+        "auto_trim": auto_trim,
+        "auto_trim_min_keep_ratio": float(auto_trim_min_keep_ratio),
         "features": features,
         "episodes": episode_manifests,
     }
@@ -822,6 +996,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="causal",
         help="Use causal online-style smoothing or offline forward-backward zero_phase smoothing.",
     )
+    parser.add_argument(
+        "--auto-trim",
+        action="store_true",
+        help="Trim start/end double-close gripper marker frames before writing each episode.",
+    )
+    parser.add_argument(
+        "--auto-trim-min-keep-ratio",
+        type=float,
+        default=0.5,
+        help="Warn when --auto-trim keeps less than this fraction of the frame-range selection.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output dataset root.")
     return parser
 
@@ -843,6 +1028,8 @@ def main() -> None:
         smooth_pika_pose=args.smooth_pika_pose,
         smooth_pika_pose_alpha=args.smooth_pika_pose_alpha,
         smooth_pika_pose_mode=args.smooth_pika_pose_mode,
+        auto_trim=args.auto_trim,
+        auto_trim_min_keep_ratio=args.auto_trim_min_keep_ratio,
         vcodec=args.vcodec,
         streaming_encoding=not args.no_streaming_encoding,
     )

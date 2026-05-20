@@ -14,6 +14,7 @@ from lerobot.scripts.convert_umi_to_lerobot_v30 import (
     CONVERSION_ENCODER_THREADS,
     CONVERSION_IMAGE_WRITER_PROCESSES,
     CONVERSION_IMAGE_WRITER_THREADS,
+    add_episode_to_dataset,
     build_state_vector,
     compute_aligned_length,
     convert_episode,
@@ -84,7 +85,13 @@ def _write_depth(path: Path, shape: tuple[int, int] = (12, 16), value: int = 100
     Image.fromarray(array).save(path)
 
 
-def _make_episode(root: Path, frames: int = 3, episode_name: str = "episode1", value_offset: int = 0) -> Path:
+def _make_episode(
+    root: Path,
+    frames: int = 3,
+    episode_name: str = "episode1",
+    value_offset: int = 0,
+    gripper_distances: list[float] | None = None,
+) -> Path:
     episode = root / episode_name
     _write_json(episode / "instructions.json", {"full-instructions": ["pick up the object"]})
     synced_names = []
@@ -110,7 +117,10 @@ def _make_episode(root: Path, frames: int = 3, episode_name: str = "episode1", v
         )
         _write_json(
             episode / "gripper/encoder/pika" / f"{stem}.json",
-            {"angle": value + 0.1, "distance": value + 0.2},
+            {
+                "angle": value + 0.1,
+                "distance": gripper_distances[idx] if gripper_distances is not None else value + 0.2,
+            },
         )
 
     for directory, suffix in (
@@ -193,6 +203,73 @@ def test_resolve_frame_slice_rejects_invalid_fraction_ranges(frame_range):
 def test_resolve_frame_slice_rejects_empty_selection():
     with pytest.raises(ValueError, match="selects no frames"):
         resolve_frame_slice(3, (0.0, 0.2))
+
+
+def test_add_episode_to_dataset_auto_trim_removes_start_and_end_double_close_markers(tmp_path):
+    distances = [0.02, 1.0, 0.02, 1.0, 1.0, 1.0, 1.0, 0.02, 1.0, 0.02]
+    episode = _make_episode(tmp_path, frames=len(distances), gripper_distances=distances)
+    dataset = _FakeDataset()
+
+    manifest = add_episode_to_dataset(dataset, episode, cameras="none", auto_trim=True)
+
+    assert manifest["auto_trim"] is True
+    assert manifest["auto_trim_start_marker_found"] is True
+    assert manifest["auto_trim_end_marker_found"] is True
+    assert manifest["auto_trim_source_frame_start_before"] == 0
+    assert manifest["auto_trim_source_frame_end_before"] == 10
+    assert manifest["source_frame_start"] == 3
+    assert manifest["source_frame_end"] == 7
+    assert manifest["selected_frames"] == 4
+    assert manifest["auto_trim_keep_ratio"] == 0.4
+    assert len(dataset.frames) == 4
+    np.testing.assert_allclose(dataset.frames[0]["observation.state"], np.array([3, 4, 5, 6, 7, 8, 1.0]))
+    np.testing.assert_allclose(dataset.frames[-1]["observation.state"], np.array([6, 7, 8, 9, 10, 11, 1.0]))
+
+
+def test_add_episode_to_dataset_auto_trim_keeps_frame_range_without_double_close_marker(tmp_path):
+    episode = _make_episode(tmp_path, frames=6, gripper_distances=[1.0, 1.0, 0.02, 1.0, 1.0, 1.0])
+    dataset = _FakeDataset()
+
+    manifest = add_episode_to_dataset(dataset, episode, cameras="none", auto_trim=True)
+
+    assert manifest["auto_trim_start_marker_found"] is False
+    assert manifest["auto_trim_end_marker_found"] is False
+    assert manifest["source_frame_start"] == 0
+    assert manifest["source_frame_end"] == 6
+    assert manifest["selected_frames"] == 6
+    assert len(dataset.frames) == 6
+
+
+def test_add_episode_to_dataset_auto_trim_ignores_single_long_close_run(tmp_path):
+    episode = _make_episode(
+        tmp_path,
+        frames=10,
+        gripper_distances=[1.0, 0.02, 0.02, 0.02, 0.02, 0.02, 1.0, 1.0, 1.0, 1.0],
+    )
+    dataset = _FakeDataset()
+
+    manifest = add_episode_to_dataset(dataset, episode, cameras="none", auto_trim=True)
+
+    assert manifest["auto_trim_start_marker_found"] is False
+    assert manifest["auto_trim_end_marker_found"] is False
+    assert manifest["source_frame_start"] == 0
+    assert manifest["source_frame_end"] == 10
+    assert len(dataset.frames) == 10
+
+
+def test_add_episode_to_dataset_auto_trim_warns_when_keep_ratio_is_low(tmp_path, caplog):
+    distances = [0.02, 1.0, 0.02, 1.0, 1.0, 1.0, 1.0, 0.02, 1.0, 0.02]
+    episode = _make_episode(tmp_path, frames=len(distances), gripper_distances=distances)
+
+    add_episode_to_dataset(
+        _FakeDataset(),
+        episode,
+        cameras="none",
+        auto_trim=True,
+        auto_trim_min_keep_ratio=0.5,
+    )
+
+    assert "below minimum 50.0%" in caplog.text
 
 
 def test_infer_features_defaults_to_fisheye_rgb(tmp_path):
@@ -451,6 +528,35 @@ def test_convert_episode_writes_fractional_frame_range(tmp_path):
     )
     assert dataset[0]["frame_index"].item() == 0
     assert dataset[5]["frame_index"].item() == 5
+
+
+@pytest.mark.skipif(not DATASETS_AVAILABLE, reason="datasets extra required")
+def test_convert_episode_writes_auto_trimmed_lerobot_dataset(tmp_path):
+    from lerobot.datasets import LeRobotDataset
+
+    distances = [0.02, 1.0, 0.02, 1.0, 1.0, 1.0, 1.0, 0.02, 1.0, 0.02]
+    episode = _make_episode(tmp_path, frames=len(distances), gripper_distances=distances)
+    output_root = tmp_path / "output"
+
+    manifest = convert_episode(
+        episode,
+        output_root,
+        repo_id="local/test-umi-auto-trim",
+        fps=30,
+        cameras="none",
+        auto_trim=True,
+    )
+    dataset = LeRobotDataset("local/test-umi-auto-trim", root=output_root)
+
+    assert manifest["auto_trim"] is True
+    assert manifest["auto_trim_keep_ratio"] == 0.4
+    assert manifest["auto_trim_source_frame_start_before"] == 0
+    assert manifest["auto_trim_source_frame_end_before"] == 10
+    assert manifest["auto_trim_start_marker_found"] is True
+    assert manifest["auto_trim_end_marker_found"] is True
+    assert len(dataset) == 4
+    np.testing.assert_allclose(dataset[0]["observation.state"], np.array([3, 4, 5, 6, 7, 8, 1.0]))
+    np.testing.assert_allclose(dataset[3]["observation.state"], np.array([6, 7, 8, 9, 10, 11, 1.0]))
 
 
 @pytest.mark.skipif(not DATASETS_AVAILABLE, reason="datasets extra required")

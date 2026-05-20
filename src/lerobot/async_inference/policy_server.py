@@ -887,6 +887,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"postprocess={postprocessing_time * 1000:.2f}ms pose_convert={pose_convert_time * 1000:.2f}ms "
             f"total={total_time * 1000:.2f}ms action_shape={tuple(action_tensor.shape)}"
         )
+        if self._diagnostics.enabled:
+            self._diagnostics.write_async_loop_event(
+                "server_pose_act_timing",
+                request_id=observation_t.get_observation().get("async_loop_request_id"),
+                observation_timestep=int(observation_t.get_timestep()),
+                prepare_ms=float(prepare_time * 1000),
+                preprocess_ms=float(preprocessing_time * 1000),
+                inference_ms=float(inference_time * 1000),
+                postprocess_ms=float(postprocessing_time * 1000),
+                pose_convert_ms=float(pose_convert_time * 1000),
+                total_ms=float(total_time * 1000),
+                chunk_size=int(action_tensor.shape[0]),
+            )
         return action_chunk
 
     def _current_pose7d_from_raw_observation(self, observation_t: TimedObservation) -> torch.Tensor:
