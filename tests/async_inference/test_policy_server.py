@@ -121,6 +121,18 @@ def _make_obs(state: torch.Tensor, timestep: int = 0, must_go: bool = False):
 # -----------------------------------------------------------------------------
 
 
+def test_pose_smolvla_is_pose_policy(policy_server):
+    from lerobot.async_inference.adapters import is_pose_act_piper
+    from lerobot.async_inference.constants import SUPPORTED_POLICIES
+
+    policy_server.policy_type = "pose_smolvla"
+
+    assert "pose_smolvla" in SUPPORTED_POLICIES
+    assert policy_server._is_pose_policy()
+    assert policy_server._dummy_action_dim() == 10
+    assert is_pose_act_piper("pose_smolvla", "piper_follower")
+
+
 def test_time_action_chunk(policy_server):
     """Verify that `_time_action_chunk` assigns correct timestamps and timesteps."""
     start_ts = time.time()

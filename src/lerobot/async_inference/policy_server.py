@@ -82,6 +82,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     prefix = "policy_server"
     logger = get_logger(prefix)
     _POSE_ACT_VIS_WINDOW = "pose_act_observation"
+    _POSE_POLICY_TYPES = {"pose_act", "pose_smolvla"}
 
     def __init__(self, config: PolicyServerConfig):
         self.config = config
@@ -442,16 +443,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """True if we should skip loading a real policy and return fake action chunks.
 
         - ``dummy_policy=True`` unconditionally activates it.
-        - ``pose_act_shell=True`` activates it only for ``policy_type == "pose_act"``.
+        - ``pose_act_shell=True`` activates it only for pose TCP policies.
         """
         if self.config.dummy_policy:
             return True
-        if self.config.pose_act_shell and self.policy_type == "pose_act":
-            return True
-        return False
+        return self.config.pose_act_shell and self._is_pose_policy()
+
+    def _is_pose_policy(self) -> bool:
+        return self.policy_type in self._POSE_POLICY_TYPES
 
     def _dummy_action_dim(self) -> int:
-        if self.policy_type == "pose_act":
+        if self._is_pose_policy():
             return 10
         return int(self.config.dummy_action_dim)
 
@@ -469,7 +471,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         deserialize_time = time.perf_counter() - start_deserialize
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
-        if self.policy_type == "pose_act":
+        if self._is_pose_policy():
             self._publish_pose_act_visualization(timed_observation)
 
         obs_timestep = timed_observation.get_timestep()
@@ -594,7 +596,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if obs.get_timestep() in predicted_timesteps:
             self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
             return False
-        if self.policy_type == "pose_act":
+        if self._is_pose_policy():
             return True
 
         elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features):
@@ -654,7 +656,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         ]
 
     def _dump_pose_act_result(self, observation_t: TimedObservation, action_chunk: list[TimedAction]) -> Path | None:
-        if self.policy_type != "pose_act" or self._result_dump_root is None or len(action_chunk) == 0:
+        if not self._is_pose_policy() or self._result_dump_root is None or len(action_chunk) == 0:
             return None
 
         raw_observation = observation_t.get_observation()
@@ -728,7 +730,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def _is_pose_act_pose7d_observation(self, observation: Observation) -> bool:
         state = observation.get(OBS_STATE)
         return (
-            self.policy_type == "pose_act"
+            self._is_pose_policy()
             and isinstance(state, torch.Tensor)
             and state.shape[-1] == 7
         )
@@ -981,7 +983,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"-> chunk(shape=({self.actions_per_chunk},{action_dim}), motion={motion_mode})"
         )
 
-        if self.policy_type == "pose_act" and state is not None and hasattr(state, "shape"):
+        if self._is_pose_policy() and state is not None and hasattr(state, "shape"):
             last_dim = int(state.shape[-1])
             if last_dim != 10:
                 self.logger.warning(
@@ -1001,7 +1003,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self, motion_mode: str, action_dim: int, observation_t: TimedObservation
     ) -> torch.Tensor:
         """Dispatch on the configured shell motion mode to synthesise a fake action chunk."""
-        if motion_mode == "zero" or self.policy_type != "pose_act" or action_dim != 10:
+        if motion_mode == "zero" or not self._is_pose_policy() or action_dim != 10:
             return torch.zeros(self.actions_per_chunk, action_dim, dtype=torch.float32)
         if motion_mode == "drift_stop_osc":
             return self._gen_drift_stop_osc_chunk(observation_t)
@@ -1063,7 +1065,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
-        if self.policy_type == "pose_act":
+        if self._is_pose_policy():
             observation = self._raw_pose_act_observation_to_observation(observation_t.get_observation())
         else:
             observation = raw_observation_to_observation(

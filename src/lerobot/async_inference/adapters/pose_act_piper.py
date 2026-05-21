@@ -30,15 +30,16 @@ import torch
 from torch import Tensor
 
 from lerobot.utils.pose_act import (
-    POSE7D_NAMES,
+    POSE7D_NAMES as POSE7D_NAMES,
     absolute_pose10d,
     euler_rpy_to_matrix,
     matrix_to_euler_rpy,
-    pose10d_to_pose7d,
     pose7d_to_pose10d,
+    pose10d_to_pose7d,
 )
 
 logger = logging.getLogger(__name__)
+POSE_POLICY_TYPES = {"pose_act", "pose_smolvla"}
 
 _IDENTITY_ROT6D = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
 R_EE_TCP = torch.tensor(
@@ -76,8 +77,8 @@ def _transform_to_pose7d(transform: Tensor, gripper: float) -> Tensor:
 
 
 def is_pose_act_piper(policy_type: str, robot_type: str) -> bool:
-    """Adapter is used when the policy is pose_act and the robot is any Piper-like follower."""
-    return policy_type == "pose_act" and robot_type == "piper_follower"
+    """Adapter is used when the policy consumes TCP pose history and the robot is Piper-like."""
+    return policy_type in POSE_POLICY_TYPES and robot_type == "piper_follower"
 
 
 class PoseActPiperAdapter:

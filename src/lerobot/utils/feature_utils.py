@@ -182,13 +182,25 @@ def infer_policy_feature_sets(
     output_features = {key: ft for key, ft in policy_features.items() if ft.type is FeatureType.ACTION}
     input_features = {key: ft for key, ft in policy_features.items() if key not in output_features}
 
-    if cfg.type == "pose_act":
+    if cfg.type in {"pose_act", "pose_smolvla"}:
         input_features = {
             key: ft
             for key, ft in input_features.items()
             if key == OBS_STATE or ft.type is FeatureType.VISUAL
         }
-        if getattr(cfg, "use_rgbd_inputs", False) or getattr(cfg, "use_rgbd_v2_inputs", False):
+        if cfg.type == "pose_smolvla":
+            input_features = {
+                key: ft
+                for key, ft in input_features.items()
+                if key == OBS_STATE
+                or (
+                    ft.type is FeatureType.VISUAL
+                    and ft.shape[0] == 3
+                    and "depth" not in key.lower()
+                    and "rgbd" not in key.lower()
+                )
+            }
+        elif getattr(cfg, "use_rgbd_inputs", False) or getattr(cfg, "use_rgbd_v2_inputs", False):
             required = [
                 cfg.fisheye_rgb_key,
                 cfg.depth_camera_rgb_key,
@@ -216,6 +228,11 @@ def infer_policy_feature_sets(
         )
     if policy_features[image_feature_key].type is not FeatureType.VISUAL:
         raise ValueError(f"Requested image feature {image_feature_key!r} is not a visual feature.")
+    if image_feature_key not in input_features:
+        raise ValueError(
+            f"Requested image feature {image_feature_key!r} is not supported by policy type {cfg.type!r}. "
+            f"Available policy input features: {sorted(input_features)}."
+        )
 
     input_features = {
         key: ft

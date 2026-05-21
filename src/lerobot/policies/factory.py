@@ -51,6 +51,7 @@ from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
 from .pose_act.configuration_pose_act import PoseACTConfig
+from .pose_smolvla.configuration_pose_smolvla import PoseSmolVLAConfig
 from .pretrained import PreTrainedPolicy
 from .sac.configuration_sac import SACConfig
 from .sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -122,6 +123,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .pose_act.modeling_pose_act import PoseACTPolicy
 
         return PoseACTPolicy
+    elif name == "pose_smolvla":
+        from .pose_smolvla.modeling_pose_smolvla import PoseSmolVLAPolicy
+
+        return PoseSmolVLAPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -204,6 +209,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return ACTConfig(**kwargs)
     elif policy_type == "pose_act":
         return PoseACTConfig(**kwargs)
+    elif policy_type == "pose_smolvla":
+        return PoseSmolVLAConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":
@@ -405,6 +412,14 @@ def make_pre_post_processors(
         from .sac.reward_model.processor_classifier import make_classifier_processor
 
         processors = make_classifier_processor(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PoseSmolVLAConfig):
+        from .pose_smolvla.processor_pose_smolvla import make_pose_smolvla_pre_post_processors
+
+        processors = make_pose_smolvla_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
