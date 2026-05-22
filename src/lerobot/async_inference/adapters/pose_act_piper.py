@@ -84,8 +84,9 @@ def is_pose_act_piper(policy_type: str, robot_type: str) -> bool:
 class PoseActPiperAdapter:
     """Stateful adapter; holds a handle to the robot so it can read current TCP on demand."""
 
-    def __init__(self, robot: Any):
+    def __init__(self, robot: Any, gripper_width_offset: float = 0.0):
         self.robot = robot
+        self.gripper_width_offset = float(gripper_width_offset)
         self._last_log_t = 0.0
 
     def ee_pose7d_to_tcp_pose7d(self, ee_pose7d: Tensor) -> Tensor:
@@ -139,7 +140,7 @@ class PoseActPiperAdapter:
             "ee.abs_rx": float(pose7d[3].item()),
             "ee.abs_ry": float(pose7d[4].item()),
             "ee.abs_rz": float(pose7d[5].item()),
-            "gripper.pos": max(0.0, float(pose7d[6].item())),
+            "gripper.pos": max(0.0, float(pose7d[6].item()) + self.gripper_width_offset),
         }
 
     def convert(self, action_tensor: Tensor) -> dict[str, float]:

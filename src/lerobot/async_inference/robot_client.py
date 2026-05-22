@@ -116,7 +116,9 @@ class RobotClient:
 
         self._pose_act_adapter: PoseActPiperAdapter | None = None
         if is_pose_act_piper(config.policy_type, config.robot.type):
-            self._pose_act_adapter = PoseActPiperAdapter(self.robot)
+            self._pose_act_adapter = PoseActPiperAdapter(
+                self.robot, gripper_width_offset=config.gripper_width_offset
+            )
         self._pose_act_history: deque[dict[str, Any]] = deque(maxlen=2)
 
         if self._pose_act_adapter is not None:

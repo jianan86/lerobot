@@ -103,3 +103,25 @@ def test_pose_act_piper_convert_pose7d_tcp_to_ee_action():
     assert action["ee.abs_ry"] == pytest.approx(float(ee_pose[4].item()), abs=1e-6)
     assert action["ee.abs_rz"] == pytest.approx(float(ee_pose[5].item()), abs=1e-6)
     assert action["gripper.pos"] == pytest.approx(0.03, abs=1e-6)
+
+
+def test_pose_act_piper_gripper_width_offset():
+    from lerobot.async_inference.adapters import PoseActPiperAdapter
+
+    adapter = PoseActPiperAdapter(_StubPoseActPiperRobot(), gripper_width_offset=-0.005)
+    tcp_pose = torch.tensor([0.1, 0.2, 0.5, 0.0, 0.0, 0.0, 0.03], dtype=torch.float32)
+
+    action = adapter.convert(tcp_pose)
+
+    assert action["gripper.pos"] == pytest.approx(0.025, abs=1e-6)
+
+
+def test_pose_act_piper_gripper_width_offset_clamps_to_zero():
+    from lerobot.async_inference.adapters import PoseActPiperAdapter
+
+    adapter = PoseActPiperAdapter(_StubPoseActPiperRobot(), gripper_width_offset=-0.005)
+    tcp_pose = torch.tensor([0.1, 0.2, 0.5, 0.0, 0.0, 0.0, 0.003], dtype=torch.float32)
+
+    action = adapter.convert(tcp_pose)
+
+    assert action["gripper.pos"] == pytest.approx(0.0, abs=1e-6)

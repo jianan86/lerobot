@@ -269,6 +269,13 @@ class RobotClientConfig:
             "the legacy chunk_size_threshold-only behavior."
         },
     )
+    gripper_width_offset: float = field(
+        default=0.0,
+        metadata={
+            "help": "Offset in meters added to PoseACT Piper gripper width before sending to the robot. "
+            "Use a negative value to reduce the commanded opening."
+        },
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -411,6 +418,7 @@ class RobotClientConfig:
             "fps": self.fps,
             "async_observation": self.async_observation,
             "observation_request_policy": self.observation_request_policy,
+            "gripper_width_offset": self.gripper_width_offset,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,

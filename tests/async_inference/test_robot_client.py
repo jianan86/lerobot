@@ -105,6 +105,22 @@ def _queue_timesteps_and_values(queue: Queue) -> tuple[list[int], list[float]]:
     return [a.get_timestep() for a in actions], [float(a.get_action()[0].item()) for a in actions]
 
 
+def test_robot_client_config_includes_gripper_width_offset():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(),
+        policy_type="pose_act",
+        pretrained_name_or_path="test",
+        actions_per_chunk=3,
+        gripper_width_offset=-0.005,
+    )
+
+    assert cfg.gripper_width_offset == pytest.approx(-0.005)
+    assert cfg.to_dict()["gripper_width_offset"] == pytest.approx(-0.005)
+
+
 class _StubPoseActPiperRobot:
     def __init__(self, fps: int = 30):
         self.fps = fps
