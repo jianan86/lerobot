@@ -86,6 +86,17 @@ def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
     return hwc_uint8_numpy
 
 
+def _drop_depth_features_for_viz(dataset: LeRobotDataset) -> None:
+    depth_keys = dataset.meta.depth_video_keys + dataset.meta.depth_image_keys
+    if not depth_keys:
+        return
+
+    logging.info("Skipping depth features for visualization: %s", ", ".join(depth_keys))
+    dataset.meta.info["features"] = {
+        key: ft for key, ft in dataset.meta.features.items() if key not in depth_keys
+    }
+
+
 def visualize_dataset(
     dataset: LeRobotDataset,
     episode_index: int,
@@ -105,6 +116,8 @@ def visualize_dataset(
         )
 
     repo_id = dataset.repo_id
+
+    _drop_depth_features_for_viz(dataset)
 
     logging.info("Loading dataloader")
     dataloader = torch.utils.data.DataLoader(
