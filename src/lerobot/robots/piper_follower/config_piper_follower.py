@@ -45,6 +45,6 @@ class PiperFollowerConfig(RobotConfig):
             "joint_6": (-2.09439, 2.09439),
         }
     )
-    gripper_limit_m: tuple[float, float] = (0.0, 0.08)
+    gripper_limit_m: tuple[float, float] = (0.0, 0.095)
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)

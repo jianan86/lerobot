@@ -17,7 +17,50 @@ import pytest
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
-from lerobot.scripts.lerobot_dataset_viz import visualize_dataset
+from lerobot.scripts.lerobot_dataset_viz import _drop_depth_features_for_viz, visualize_dataset
+
+
+class _FakeMetadata:
+    def __init__(self):
+        self.info = {
+            "features": {
+                "observation.images.front": {"dtype": "video"},
+                "observation.depth.depth_camera": {"dtype": "depth_video"},
+                "observation.depth.side": {"dtype": "depth_image"},
+                "observation.state": {"dtype": "float32"},
+            }
+        }
+
+    @property
+    def features(self):
+        return self.info["features"]
+
+    @property
+    def camera_keys(self):
+        return [key for key, ft in self.features.items() if ft["dtype"] in ["video", "image"]]
+
+    @property
+    def depth_video_keys(self):
+        return [key for key, ft in self.features.items() if ft["dtype"] == "depth_video"]
+
+    @property
+    def depth_image_keys(self):
+        return [key for key, ft in self.features.items() if ft["dtype"] == "depth_image"]
+
+
+class _FakeDataset:
+    def __init__(self):
+        self.meta = _FakeMetadata()
+
+
+def test_drop_depth_features_for_viz_keeps_rgb_cameras():
+    dataset = _FakeDataset()
+
+    _drop_depth_features_for_viz(dataset)
+
+    assert "observation.depth.depth_camera" not in dataset.meta.features
+    assert "observation.depth.side" not in dataset.meta.features
+    assert dataset.meta.camera_keys == ["observation.images.front"]
 
 
 @pytest.mark.skip("TODO: add dummy videos")
