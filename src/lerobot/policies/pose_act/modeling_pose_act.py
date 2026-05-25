@@ -32,6 +32,35 @@ from ..pretrained import PreTrainedPolicy
 from .configuration_pose_act import PoseACTConfig
 from .rgbd import fuse_pose_act_rgbd_observation
 
+POSE_ACT_GRIPPER_INDEX = 9
+
+
+def weighted_pose_act_l1_loss(
+    target: Tensor,
+    pred: Tensor,
+    action_is_pad: Tensor,
+    gripper_loss_weight: float,
+) -> tuple[Tensor, dict[str, float]]:
+    l1 = F.l1_loss(target, pred, reduction="none")
+    valid = ~action_is_pad.unsqueeze(-1)
+    weights = torch.ones(target.shape[-1], dtype=l1.dtype, device=l1.device)
+    weights[POSE_ACT_GRIPPER_INDEX] = gripper_loss_weight
+    weighted_l1 = l1 * valid * weights
+    l1_loss = weighted_l1.mean()
+
+    valid_count = valid.sum().clamp_min(1)
+    per_dim_l1 = (l1 * valid).sum(dim=(0, 1)) / valid_count
+    gripper_l1 = per_dim_l1[POSE_ACT_GRIPPER_INDEX]
+    loss_dict = {
+        "l1_loss": l1_loss.item(),
+        "xyz_l1_loss": per_dim_l1[:3].mean().item(),
+        "rot6d_l1_loss": per_dim_l1[3:POSE_ACT_GRIPPER_INDEX].mean().item(),
+        "gripper_l1_loss": gripper_l1.item(),
+        "weighted_gripper_l1_loss": (gripper_l1 * gripper_loss_weight).item(),
+        "gripper_loss_weight": float(gripper_loss_weight),
+    }
+    return l1_loss, loss_dict
+
 
 class PoseACTPolicy(PreTrainedPolicy):
     """ACT-style policy over relative TCP pose chunks with observation history."""
@@ -194,11 +223,12 @@ class PoseACTPolicy(PreTrainedPolicy):
         batch = self._prepare_batch(batch)
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
-
-        loss_dict = {"l1_loss": l1_loss.item()}
+        l1_loss, loss_dict = weighted_pose_act_l1_loss(
+            batch[ACTION],
+            actions_hat,
+            batch["action_is_pad"],
+            self.config.gripper_loss_weight,
+        )
         if self.config.use_vae:
             mean_kld = (
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()

@@ -48,6 +48,7 @@ class PoseACTConfig(ACTConfig):
     depth_unit_scale: float = 0.001
     depth_min_m: float = 0.1
     depth_max_m: float = 5.0
+    gripper_loss_weight: float = 1.0
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -84,6 +85,11 @@ class PoseACTConfig(ACTConfig):
             )
         if self.use_rgbd_inputs and self.use_rgbd_v2_inputs:
             raise ValueError("pose_act RGBD v1 and RGBD v2 input modes are mutually exclusive.")
+        if self.gripper_loss_weight <= 0:
+            raise ValueError(
+                "`gripper_loss_weight` must be positive. "
+                f"Got {self.gripper_loss_weight}."
+            )
 
     def validate_features(self) -> None:
         if not self.image_features:

@@ -6,7 +6,7 @@ import torch
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.pose_act.configuration_pose_act import PoseACTConfig
-from lerobot.policies.pose_act.modeling_pose_act import PoseACTPolicy
+from lerobot.policies.pose_act.modeling_pose_act import PoseACTPolicy, weighted_pose_act_l1_loss
 from lerobot.policies.pose_act.processor_pose_act import (
     AbsolutePoseActionProcessorStep,
     RelativePoseActionProcessorStep,
@@ -14,6 +14,38 @@ from lerobot.policies.pose_act.processor_pose_act import (
 from lerobot.policies.pose_act.utils import pose7d_to_pose10d, pose10d_to_pose7d
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.feature_utils import infer_policy_feature_sets
+
+
+def test_pose_act_gripper_loss_weight_defaults_to_unweighted_l1():
+    target = torch.zeros(2, 4, 10)
+    pred = torch.arange(80, dtype=torch.float32).reshape(2, 4, 10) / 100
+    action_is_pad = torch.zeros(2, 4, dtype=torch.bool)
+
+    loss, loss_dict = weighted_pose_act_l1_loss(target, pred, action_is_pad, gripper_loss_weight=1.0)
+    expected = torch.nn.functional.l1_loss(target, pred, reduction="none").mean()
+
+    torch.testing.assert_close(loss, expected)
+    assert loss_dict["gripper_loss_weight"] == 1.0
+    assert "gripper_l1_loss" in loss_dict
+
+
+def test_pose_act_gripper_loss_weight_scales_gripper_and_respects_padding():
+    target = torch.zeros(1, 2, 10)
+    pred = torch.zeros(1, 2, 10)
+    pred[0, 0, 9] = 2.0
+    pred[0, 1, 9] = 100.0
+    action_is_pad = torch.tensor([[False, True]])
+
+    loss, loss_dict = weighted_pose_act_l1_loss(target, pred, action_is_pad, gripper_loss_weight=5.0)
+
+    torch.testing.assert_close(loss, torch.tensor(0.5))
+    assert loss_dict["gripper_l1_loss"] == pytest.approx(2.0)
+    assert loss_dict["weighted_gripper_l1_loss"] == pytest.approx(10.0)
+
+
+def test_pose_act_rejects_non_positive_gripper_loss_weight():
+    with pytest.raises(ValueError, match="gripper_loss_weight"):
+        PoseACTConfig(device="cpu", gripper_loss_weight=0.0)
 
 
 def test_pose_act_forward_and_select_action():
