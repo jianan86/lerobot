@@ -40,10 +40,9 @@ from .utils import (
     DEFAULT_DATA_PATH,
     DEFAULT_EPISODES_PATH,
     DEFAULT_VIDEO_FILE_SIZE_IN_MB,
-    DEFAULT_VIDEO_PATH,
     update_chunk_file_indices,
 )
-from .video_utils import concatenate_video_files, get_video_duration_in_s
+from .video_utils import concatenate_video_files
 
 
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
@@ -275,7 +274,7 @@ def aggregate_datasets(
         ]
     )
     fps, robot_type, features = validate_all_metadata(all_metadata)
-    video_keys = [key for key in features if features[key]["dtype"] == "video"]
+    video_keys = [key for key in features if features[key]["dtype"] in ("video", "depth_video")]
 
     dst_meta = LeRobotDatasetMetadata.create(
         repo_id=aggr_repo_id,
@@ -363,19 +362,38 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
         dst_file_durations = video_idx["dst_file_durations"]
 
         for src_chunk_idx, src_file_idx in unique_chunk_file_pairs:
-            src_path = src_meta.root / DEFAULT_VIDEO_PATH.format(
+            src_video_path = src_meta.depth_video_path if key in src_meta.depth_video_keys else src_meta.video_path
+            dst_video_path = dst_meta.depth_video_path if key in dst_meta.depth_video_keys else dst_meta.video_path
+            if src_video_path is None or dst_video_path is None:
+                raise ValueError(f"Missing video path template for video key {key}.")
+
+            src_path = src_meta.root / src_video_path.format(
                 video_key=key,
                 chunk_index=src_chunk_idx,
                 file_index=src_file_idx,
             )
 
-            dst_path = dst_meta.root / DEFAULT_VIDEO_PATH.format(
+            dst_path = dst_meta.root / dst_video_path.format(
                 video_key=key,
                 chunk_index=chunk_idx,
                 file_index=file_idx,
             )
 
-            src_duration = get_video_duration_in_s(src_path)
+            to_timestamp_col = f"videos/{key}/to_timestamp"
+            chunk_col = f"videos/{key}/chunk_index"
+            file_col = f"videos/{key}/file_index"
+            src_duration = float(
+                max(
+                    to_timestamp
+                    for chunk, file, to_timestamp in zip(
+                        src_meta.episodes[chunk_col],
+                        src_meta.episodes[file_col],
+                        src_meta.episodes[to_timestamp_col],
+                        strict=False,
+                    )
+                    if chunk == src_chunk_idx and file == src_file_idx
+                )
+            )
             dst_key = (chunk_idx, file_idx)
 
             if not dst_path.exists():
@@ -399,7 +417,7 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
                 dst_key = (chunk_idx, file_idx)
                 videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = 0
                 videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
-                dst_path = dst_meta.root / DEFAULT_VIDEO_PATH.format(
+                dst_path = dst_meta.root / dst_video_path.format(
                     video_key=key,
                     chunk_index=chunk_idx,
                     file_index=file_idx,
