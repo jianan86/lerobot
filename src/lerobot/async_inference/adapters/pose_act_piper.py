@@ -84,9 +84,10 @@ def is_pose_act_piper(policy_type: str, robot_type: str) -> bool:
 class PoseActPiperAdapter:
     """Stateful adapter; holds a handle to the robot so it can read current TCP on demand."""
 
-    def __init__(self, robot: Any, gripper_width_offset: float = 0.0):
+    def __init__(self, robot: Any, gripper_width_offset: float = 0.0, gripper: Any | None = None):
         self.robot = robot
         self.gripper_width_offset = float(gripper_width_offset)
+        self.gripper = gripper
         self._last_log_t = 0.0
 
     def ee_pose7d_to_tcp_pose7d(self, ee_pose7d: Tensor) -> Tensor:
@@ -111,10 +112,13 @@ class PoseActPiperAdapter:
             )
         pose = get_end_pose()
         gripper = 0.0
-        get_motor_positions = getattr(self.robot, "_get_motor_positions", None)
-        if get_motor_positions is not None:
-            motors = get_motor_positions()
-            gripper = float(motors.get("gripper.pos", 0.0))
+        if self.gripper is not None:
+            gripper = float(self.gripper.read_width())
+        else:
+            get_motor_positions = getattr(self.robot, "_get_motor_positions", None)
+            if get_motor_positions is not None:
+                motors = get_motor_positions()
+                gripper = float(motors.get("gripper.pos", 0.0))
         ee_pose7d = torch.tensor(
             [
                 float(pose["x"]),

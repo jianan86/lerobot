@@ -59,6 +59,9 @@ DEFAULT_REPO_ID = "local/umi-0421-v30"
 DEFAULT_TASK = "umi episode"
 DEFAULT_CAMERAS = ("fisheye_rgb",)
 CAMERA_STORAGE_CHOICES = ("image", "video")
+ARM_MODE_CHOICES = ("single", "dual")
+SINGLE_ARM_SIDE_CHOICES = ("left", "right")
+ARM_SIDE_SUFFIXES = {"left": "_l", "right": "_r"}
 VIDEO_CODEC_CHOICES = (
     "h264",
     "hevc",
@@ -377,6 +380,58 @@ def parse_cameras(cameras: str | list[str] | tuple[str, ...] | None) -> tuple[st
     return selected
 
 
+def _with_arm_suffix(path: Path, side: str | None) -> Path:
+    if side is None:
+        return path
+    try:
+        suffix = ARM_SIDE_SUFFIXES[side]
+    except KeyError as exc:
+        raise ValueError(f"single_arm_side must be one of {SINGLE_ARM_SIDE_CHOICES}, got {side!r}") from exc
+    return path.with_name(f"{path.name}{suffix}")
+
+
+def resolve_modality_dir(base_dir: Path, relative_dir: Path, single_arm_side: str | None = None) -> Path:
+    return base_dir / _with_arm_suffix(relative_dir, single_arm_side)
+
+
+def detect_episode_arm_mode(episode_dir: Path) -> str:
+    episode_dir = Path(episode_dir)
+    single_pose_dir = resolve_modality_dir(episode_dir, POSE_DIR)
+    single_gripper_dir = resolve_modality_dir(episode_dir, GRIPPER_DIR)
+    if single_pose_dir.is_dir() and single_gripper_dir.is_dir():
+        return "single"
+
+    has_left = resolve_modality_dir(episode_dir, POSE_DIR, "left").is_dir() and resolve_modality_dir(
+        episode_dir, GRIPPER_DIR, "left"
+    ).is_dir()
+    has_right = resolve_modality_dir(episode_dir, POSE_DIR, "right").is_dir() and resolve_modality_dir(
+        episode_dir, GRIPPER_DIR, "right"
+    ).is_dir()
+    if has_left and has_right:
+        return "dual"
+
+    raise ValueError(f"Could not detect single-arm or dual-arm UMI episode layout: {episode_dir}")
+
+
+def resolve_conversion_arm_selection(
+    input_arm_mode: str,
+    output_arm_mode: str,
+    single_arm_side: str | None,
+) -> str | None:
+    if output_arm_mode not in ARM_MODE_CHOICES:
+        raise ValueError(f"output_arm_mode must be one of {ARM_MODE_CHOICES}, got {output_arm_mode!r}")
+    if single_arm_side is not None and single_arm_side not in SINGLE_ARM_SIDE_CHOICES:
+        raise ValueError(f"single_arm_side must be one of {SINGLE_ARM_SIDE_CHOICES}, got {single_arm_side!r}")
+
+    if output_arm_mode == "dual":
+        raise NotImplementedError("Dual-arm LeRobot output is not implemented yet for UMI conversion.")
+    if input_arm_mode == "single":
+        return None
+    if single_arm_side is None:
+        raise ValueError("Dual-arm input with single-arm output requires --single-arm-side left or right.")
+    return single_arm_side
+
+
 def infer_features(
     modality_files: dict[str, list[Path]],
     cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
@@ -469,18 +524,21 @@ def add_camera_frame_data(
 def discover_episode_files(
     episode_dir: Path,
     cameras: str | list[str] | tuple[str, ...] | None = DEFAULT_CAMERAS,
+    single_arm_side: str | None = None,
 ) -> dict[str, list[Path]]:
     selected_cameras = parse_cameras(cameras)
     files = {
-        "pose": load_synced_files(episode_dir / POSE_DIR),
-        "gripper": load_synced_files(episode_dir / GRIPPER_DIR),
+        "pose": load_synced_files(resolve_modality_dir(episode_dir, POSE_DIR, single_arm_side)),
+        "gripper": load_synced_files(resolve_modality_dir(episode_dir, GRIPPER_DIR, single_arm_side)),
     }
 
     for camera in selected_cameras:
         if camera in RGB_CAMERA_DIRS:
-            files[camera] = load_synced_files(episode_dir / RGB_CAMERA_DIRS[camera])
+            files[camera] = load_synced_files(
+                resolve_modality_dir(episode_dir, RGB_CAMERA_DIRS[camera], single_arm_side)
+            )
         elif camera == DEPTH_CAMERA:
-            files[camera] = load_synced_files(episode_dir / DEPTH_DIR)
+            files[camera] = load_synced_files(resolve_modality_dir(episode_dir, DEPTH_DIR, single_arm_side))
 
     return files
 
@@ -589,11 +647,14 @@ def resolve_auto_trim_frame_slice(
     synced_gripper_files: list[Path],
     source_frame_start: int,
     source_frame_end: int,
+    single_arm_side: str | None = None,
 ) -> tuple[int, int, bool, bool]:
     synced_timestamps = np.asarray([_timestamp_from_path(path) for path in synced_gripper_files], dtype=np.float64)
     selected_start_time = synced_timestamps[source_frame_start]
     selected_end_time = synced_timestamps[source_frame_end - 1]
-    all_timestamps, all_distances = load_gripper_timeseries(input_episode / GRIPPER_DIR)
+    all_timestamps, all_distances = load_gripper_timeseries(
+        resolve_modality_dir(input_episode, GRIPPER_DIR, single_arm_side)
+    )
     in_selected_time = (selected_start_time <= all_timestamps) & (all_timestamps <= selected_end_time)
     timestamps = all_timestamps[in_selected_time]
     distances = all_distances[in_selected_time]
@@ -643,10 +704,11 @@ def add_episode_to_dataset(
     smooth_pika_pose_mode: str = "causal",
     auto_trim: bool = False,
     auto_trim_min_keep_ratio: float = 0.5,
+    single_arm_side: str | None = None,
 ) -> dict[str, Any]:
     input_episode = Path(input_episode)
     selected_cameras = parse_cameras(cameras)
-    modality_files = discover_episode_files(input_episode, cameras=selected_cameras)
+    modality_files = discover_episode_files(input_episode, cameras=selected_cameras, single_arm_side=single_arm_side)
     aligned_length = compute_aligned_length(modality_files)
     source_frame_start, source_frame_end = resolve_frame_slice(aligned_length, frame_range)
     source_frame_start_before_auto_trim = source_frame_start
@@ -660,6 +722,7 @@ def add_episode_to_dataset(
                 modality_files["gripper"],
                 source_frame_start,
                 source_frame_end,
+                single_arm_side=single_arm_side,
             )
         )
     available_frame_count = source_frame_end_before_auto_trim - source_frame_start_before_auto_trim
@@ -730,6 +793,7 @@ def add_episode_to_dataset(
         "task": task_text,
         "cameras": selected_cameras,
         "camera_storage": camera_storage,
+        "single_arm_side": single_arm_side,
         "auto_trim": auto_trim,
         "auto_trim_keep_ratio": auto_trim_keep_ratio,
         "auto_trim_source_frame_start_before": source_frame_start_before_auto_trim,
@@ -760,6 +824,8 @@ def convert_episode(
     auto_trim_min_keep_ratio: float = 0.5,
     vcodec: str = DEFAULT_VIDEO_CODEC,
     streaming_encoding: bool | None = None,
+    output_arm_mode: str = "single",
+    single_arm_side: str | None = None,
 ) -> dict[str, Any]:
     input_episode = Path(input_episode)
     output_root = Path(output_root)
@@ -767,7 +833,11 @@ def convert_episode(
     if use_videos:
         camera_storage = "video"
 
-    modality_files = discover_episode_files(input_episode, cameras=selected_cameras)
+    input_arm_mode = detect_episode_arm_mode(input_episode)
+    selected_arm_side = resolve_conversion_arm_selection(input_arm_mode, output_arm_mode, single_arm_side)
+    modality_files = discover_episode_files(
+        input_episode, cameras=selected_cameras, single_arm_side=selected_arm_side
+    )
     features = infer_features(modality_files, cameras=selected_cameras, camera_storage=camera_storage)
 
     if output_root.exists():
@@ -799,6 +869,7 @@ def convert_episode(
             smooth_pika_pose_mode=smooth_pika_pose_mode,
             auto_trim=auto_trim,
             auto_trim_min_keep_ratio=auto_trim_min_keep_ratio,
+            single_arm_side=selected_arm_side,
         )
         dataset.finalize()
     except Exception:
@@ -810,6 +881,8 @@ def convert_episode(
         "input_episode": str(input_episode),
         "output_root": str(output_root),
         "fps": fps,
+        "input_arm_mode": input_arm_mode,
+        "output_arm_mode": output_arm_mode,
         **episode_manifest,
         "vcodec": vcodec,
         "streaming_encoding": conversion_uses_streaming_encoding(features, streaming_encoding),
@@ -826,6 +899,15 @@ def discover_episode_dirs(input_root: Path) -> list[Path]:
     if not episode_dirs:
         raise ValueError(f"No episode subdirectories found under: {input_root}")
     return episode_dirs
+
+
+def detect_common_input_arm_mode(episode_dirs: list[Path]) -> str:
+    input_arm_modes = {episode_dir: detect_episode_arm_mode(episode_dir) for episode_dir in episode_dirs}
+    unique_modes = set(input_arm_modes.values())
+    if len(unique_modes) != 1:
+        formatted = {str(path): mode for path, mode in input_arm_modes.items()}
+        raise ValueError(f"Input episodes must all use the same arm layout, got: {formatted}")
+    return next(iter(unique_modes))
 
 
 def convert_episodes(
@@ -846,6 +928,8 @@ def convert_episodes(
     auto_trim_min_keep_ratio: float = 0.5,
     vcodec: str = DEFAULT_VIDEO_CODEC,
     streaming_encoding: bool | None = None,
+    output_arm_mode: str = "single",
+    single_arm_side: str | None = None,
 ) -> dict[str, Any]:
     input_root = Path(input_root)
     output_root = Path(output_root)
@@ -854,7 +938,11 @@ def convert_episodes(
         camera_storage = "video"
 
     episode_dirs = discover_episode_dirs(input_root)
-    first_modality_files = discover_episode_files(episode_dirs[0], cameras=selected_cameras)
+    input_arm_mode = detect_common_input_arm_mode(episode_dirs)
+    selected_arm_side = resolve_conversion_arm_selection(input_arm_mode, output_arm_mode, single_arm_side)
+    first_modality_files = discover_episode_files(
+        episode_dirs[0], cameras=selected_cameras, single_arm_side=selected_arm_side
+    )
     features = infer_features(first_modality_files, cameras=selected_cameras, camera_storage=camera_storage)
 
     if output_root.exists():
@@ -890,6 +978,7 @@ def convert_episodes(
                     smooth_pika_pose_mode=smooth_pika_pose_mode,
                     auto_trim=auto_trim,
                     auto_trim_min_keep_ratio=auto_trim_min_keep_ratio,
+                    single_arm_side=selected_arm_side,
                 )
             )
         dataset.finalize()
@@ -902,6 +991,9 @@ def convert_episodes(
         "input_root": str(input_root),
         "output_root": str(output_root),
         "fps": fps,
+        "input_arm_mode": input_arm_mode,
+        "output_arm_mode": output_arm_mode,
+        "single_arm_side": selected_arm_side,
         "total_episodes": len(episode_manifests),
         "total_selected_frames": sum(item["selected_frames"] for item in episode_manifests),
         "cameras": selected_cameras,
@@ -956,6 +1048,17 @@ def build_parser() -> argparse.ArgumentParser:
             f"Comma-separated cameras to convert. Supported: {', '.join(SUPPORTED_CAMERAS)}. "
             "Use 'none' for no cameras."
         ),
+    )
+    parser.add_argument(
+        "--output-arm-mode",
+        choices=ARM_MODE_CHOICES,
+        default="single",
+        help="Output arm layout to generate. Dual-arm output is reserved for future implementation.",
+    )
+    parser.add_argument(
+        "--single-arm-side",
+        choices=SINGLE_ARM_SIDE_CHOICES,
+        help="Arm side to export when converting dual-arm input to single-arm output.",
     )
     parser.add_argument(
         "--camera-storage",
@@ -1032,6 +1135,8 @@ def main() -> None:
         auto_trim_min_keep_ratio=args.auto_trim_min_keep_ratio,
         vcodec=args.vcodec,
         streaming_encoding=not args.no_streaming_encoding,
+        output_arm_mode=args.output_arm_mode,
+        single_arm_side=args.single_arm_side,
     )
     print(json.dumps(manifest, indent=2))
 

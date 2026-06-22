@@ -276,6 +276,22 @@ class RobotClientConfig:
             "Use a negative value to reduce the commanded opening."
         },
     )
+    use_pika_gripper: bool = field(
+        default=True,
+        metadata={"help": "If True, use Pika SDK for PoseACT Piper gripper reads and commands."},
+    )
+    pika_gripper_port: str = field(
+        default="/dev/ttyUSB0",
+        metadata={"help": "Serial port for the Pika gripper used by PoseACT Piper async client."},
+    )
+    pika_gripper_min_width_m: float = field(
+        default=0.0,
+        metadata={"help": "Minimum Pika gripper width command in meters."},
+    )
+    pika_gripper_max_width_m: float = field(
+        default=0.09,
+        metadata={"help": "Maximum Pika gripper width command in meters."},
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -356,6 +372,21 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if not self.pika_gripper_port:
+            raise ValueError("pika_gripper_port cannot be empty")
+
+        if self.pika_gripper_min_width_m < 0:
+            raise ValueError(
+                f"pika_gripper_min_width_m must be non-negative, got {self.pika_gripper_min_width_m}"
+            )
+
+        if self.pika_gripper_max_width_m < self.pika_gripper_min_width_m:
+            raise ValueError(
+                "pika_gripper_max_width_m must be greater than or equal to "
+                f"pika_gripper_min_width_m, got {self.pika_gripper_max_width_m} < "
+                f"{self.pika_gripper_min_width_m}"
+            )
+
         if self.observation_request_policy not in {"single_flight", "threshold"}:
             raise ValueError(
                 "observation_request_policy must be one of ['single_flight', 'threshold'], "
@@ -419,6 +450,10 @@ class RobotClientConfig:
             "async_observation": self.async_observation,
             "observation_request_policy": self.observation_request_policy,
             "gripper_width_offset": self.gripper_width_offset,
+            "use_pika_gripper": self.use_pika_gripper,
+            "pika_gripper_port": self.pika_gripper_port,
+            "pika_gripper_min_width_m": self.pika_gripper_min_width_m,
+            "pika_gripper_max_width_m": self.pika_gripper_max_width_m,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,

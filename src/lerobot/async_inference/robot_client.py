@@ -99,6 +99,54 @@ class ObservationRequest:
     must_go: bool
 
 
+class PikaGripper:
+    def __init__(self, port: str, min_width_m: float, max_width_m: float):
+        self.port = port
+        self.min_width_m = float(min_width_m)
+        self.max_width_m = float(max_width_m)
+        self.device: Any | None = None
+
+    def connect(self) -> None:
+        try:
+            from pika.gripper import Gripper
+        except ImportError as e:
+            raise ImportError(
+                "Pika SDK is required for PoseACT Piper gripper control. "
+                "Install it in the client environment, for example: "
+                "python -m pip install -e /path/to/pika_sdk --no-deps, "
+                "and install pyserial."
+            ) from e
+
+        self.device = Gripper(self.port)
+        if not self.device.connect():
+            self.device = None
+            raise RuntimeError(f"Failed to connect Pika gripper on {self.port}.")
+        if not self.device.enable():
+            self.disconnect()
+            raise RuntimeError(f"Failed to enable Pika gripper on {self.port}.")
+
+    def read_width(self) -> float:
+        if self.device is None:
+            raise RuntimeError("Pika gripper is not connected.")
+        return max(float(self.device.get_gripper_distance()) / 1000.0, 0.0)
+
+    def execute_width(self, width_m: float) -> float:
+        if self.device is None:
+            raise RuntimeError("Pika gripper is not connected.")
+        clipped_width_m = min(max(float(width_m), self.min_width_m), self.max_width_m)
+        if not self.device.set_gripper_distance(clipped_width_m * 1000.0):
+            raise RuntimeError(f"Failed to command Pika gripper width {clipped_width_m:.4f} m.")
+        return clipped_width_m
+
+    def disconnect(self) -> None:
+        if self.device is None:
+            return
+        try:
+            self.device.disconnect()
+        finally:
+            self.device = None
+
+
 class RobotClient:
     prefix = "robot_client"
     logger = get_logger(prefix)
@@ -114,10 +162,20 @@ class RobotClient:
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
 
+        self._pika_gripper: PikaGripper | None = None
         self._pose_act_adapter: PoseActPiperAdapter | None = None
         if is_pose_act_piper(config.policy_type, config.robot.type):
+            if config.use_pika_gripper:
+                self._pika_gripper = PikaGripper(
+                    config.pika_gripper_port,
+                    min_width_m=config.pika_gripper_min_width_m,
+                    max_width_m=config.pika_gripper_max_width_m,
+                )
+                self._pika_gripper.connect()
             self._pose_act_adapter = PoseActPiperAdapter(
-                self.robot, gripper_width_offset=config.gripper_width_offset
+                self.robot,
+                gripper_width_offset=config.gripper_width_offset,
+                gripper=self._pika_gripper,
             )
         self._pose_act_history: deque[dict[str, Any]] = deque(maxlen=2)
 
@@ -241,11 +299,17 @@ class RobotClient:
         self.shutdown_event.set()
         self._stop_observation_worker()
 
-        self.robot.disconnect()
-        self.logger.debug("Robot disconnected")
-
-        self.channel.close()
-        self.logger.debug("Client stopped, channel closed")
+        try:
+            if self._pika_gripper is not None:
+                self._pika_gripper.disconnect()
+                self.logger.debug("Pika gripper disconnected")
+        finally:
+            try:
+                self.robot.disconnect()
+                self.logger.debug("Robot disconnected")
+            finally:
+                self.channel.close()
+                self.logger.debug("Client stopped, channel closed")
 
     def send_observation(
         self,
@@ -897,6 +961,13 @@ class RobotClient:
         n = min(len(keys), int(action_tensor.shape[0]))
         return {keys[i]: action_tensor[i].item() for i in range(n)}
 
+    def _split_pika_gripper_action(self, action_dict: dict[str, float]) -> tuple[dict[str, float], float | None]:
+        if self._pika_gripper is None or "gripper.pos" not in action_dict:
+            return action_dict, None
+        robot_action = dict(action_dict)
+        gripper_width = float(robot_action.pop("gripper.pos"))
+        return robot_action, gripper_width
+
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
         """Reading and performing actions in local queue"""
 
@@ -909,7 +980,13 @@ class RobotClient:
         get_end = time.perf_counter() - get_start
 
         action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
-        _performed_action = self.robot.send_action(action_dict)
+        robot_action, pika_gripper_width = self._split_pika_gripper_action(action_dict)
+        _performed_action = self.robot.send_action(robot_action)
+        if pika_gripper_width is not None:
+            assert self._pika_gripper is not None
+            performed_gripper_width = self._pika_gripper.execute_width(pika_gripper_width)
+            _performed_action = dict(_performed_action)
+            _performed_action["gripper.pos"] = performed_gripper_width
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
 

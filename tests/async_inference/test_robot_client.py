@@ -19,7 +19,9 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import sys
 import time
+import types
 from queue import Queue
 
 import numpy as np
@@ -105,7 +107,7 @@ def _queue_timesteps_and_values(queue: Queue) -> tuple[list[int], list[float]]:
     return [a.get_timestep() for a in actions], [float(a.get_action()[0].item()) for a in actions]
 
 
-def test_robot_client_config_includes_gripper_width_offset():
+def test_robot_client_config_includes_pose_act_gripper_options():
     from lerobot.async_inference.configs import RobotClientConfig
     from tests.mocks.mock_robot import MockRobotConfig
 
@@ -118,7 +120,57 @@ def test_robot_client_config_includes_gripper_width_offset():
     )
 
     assert cfg.gripper_width_offset == pytest.approx(-0.005)
+    assert cfg.use_pika_gripper is True
+    assert cfg.pika_gripper_port == "/dev/ttyUSB0"
+    assert cfg.pika_gripper_min_width_m == pytest.approx(0.0)
+    assert cfg.pika_gripper_max_width_m == pytest.approx(0.09)
     assert cfg.to_dict()["gripper_width_offset"] == pytest.approx(-0.005)
+    assert cfg.to_dict()["use_pika_gripper"] is True
+    assert cfg.to_dict()["pika_gripper_port"] == "/dev/ttyUSB0"
+    assert cfg.to_dict()["pika_gripper_min_width_m"] == pytest.approx(0.0)
+    assert cfg.to_dict()["pika_gripper_max_width_m"] == pytest.approx(0.09)
+
+
+class _FakePikaGripper:
+    instances = []
+
+    def __init__(self, port: str):
+        self.port = port
+        self.connected = False
+        self.enabled = False
+        self.disconnected = False
+        self.distance_mm = 42.0
+        self.commands_mm = []
+        _FakePikaGripper.instances.append(self)
+
+    def connect(self) -> bool:
+        self.connected = True
+        return True
+
+    def enable(self) -> bool:
+        self.enabled = True
+        return True
+
+    def disconnect(self) -> None:
+        self.disconnected = True
+
+    def get_gripper_distance(self) -> float:
+        return self.distance_mm
+
+    def set_gripper_distance(self, width_mm: float) -> bool:
+        self.commands_mm.append(float(width_mm))
+        self.distance_mm = float(width_mm)
+        return True
+
+
+def _install_fake_pika(monkeypatch):
+    _FakePikaGripper.instances.clear()
+    pika_module = types.ModuleType("pika")
+    gripper_module = types.ModuleType("pika.gripper")
+    gripper_module.Gripper = _FakePikaGripper
+    monkeypatch.setitem(sys.modules, "pika", pika_module)
+    monkeypatch.setitem(sys.modules, "pika.gripper", gripper_module)
+    return _FakePikaGripper
 
 
 class _StubPoseActPiperRobot:
@@ -137,6 +189,7 @@ class _StubPoseActPiperRobot:
         }
         self._ee_state = {"x": 0.2, "y": 0.0, "z": 0.3, "rx": 0.0, "ry": 0.0, "rz": 0.0}
         self.observation_features = {"front": (480, 640, 3)}
+        self.sent_actions = []
 
     @property
     def is_connected(self) -> bool:
@@ -161,11 +214,16 @@ class _StubPoseActPiperRobot:
         obs["front"] = self._rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
         return obs
 
+    def send_action(self, action: dict[str, float]) -> dict[str, float]:
+        self.sent_actions.append(dict(action))
+        return dict(action)
+
 
 def _make_pose_act_piper_client(
     monkeypatch,
     async_observation: bool = False,
     observation_request_policy: str = "single_flight",
+    use_pika_gripper: bool = False,
 ):
     from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.async_inference.robot_client import RobotClient
@@ -185,6 +243,7 @@ def _make_pose_act_piper_client(
             actions_per_chunk=3,
             async_observation=async_observation,
             observation_request_policy=observation_request_policy,
+            use_pika_gripper=use_pika_gripper,
         )
     )
 
@@ -699,6 +758,111 @@ def test_pose_act_piper_send_failure_does_not_mark_request_in_flight(monkeypatch
         client.stop()
 
 
+def test_pose_act_piper_client_connects_pika_gripper_by_default(monkeypatch):
+    fake_pika = _install_fake_pika(monkeypatch)
+
+    client = _make_pose_act_piper_client(monkeypatch, use_pika_gripper=True)
+
+    try:
+        fake = fake_pika.instances[0]
+        assert fake.port == "/dev/ttyUSB0"
+        assert fake.connected is True
+        assert fake.enabled is True
+    finally:
+        client.stop()
+
+    assert fake.disconnected is True
+
+
+def test_pose_act_piper_client_reads_pika_gripper_width(monkeypatch):
+    from lerobot.utils.constants import OBS_STATE
+
+    fake_pika = _install_fake_pika(monkeypatch)
+    client = _make_pose_act_piper_client(monkeypatch, use_pika_gripper=True)
+    fake_pika.instances[0].distance_mm = 55.0
+    sent = []
+    monkeypatch.setattr(client, "send_observation", lambda obs: sent.append(obs) or True)
+
+    try:
+        raw_observation = client.control_loop_observation(task="test")
+    finally:
+        client.stop()
+
+    assert raw_observation["gripper_width"] == pytest.approx(0.055)
+    observation = sent[0].get_observation()
+    assert observation[OBS_STATE][1, 6].item() == pytest.approx(0.055)
+
+
+def test_pose_act_piper_client_sends_gripper_action_to_pika_not_piper(monkeypatch):
+    from lerobot.async_inference.helpers import TimedAction
+
+    fake_pika = _install_fake_pika(monkeypatch)
+    client = _make_pose_act_piper_client(monkeypatch, use_pika_gripper=True)
+
+    try:
+        action = torch.tensor([0.21, 0.02, 0.31, 0.0, 0.0, 0.0, 0.04], dtype=torch.float32)
+        client.action_queue.put(TimedAction(action=action, timestep=0, timestamp=time.time()))
+
+        performed = client.control_loop_action()
+
+        assert client.robot.sent_actions
+        assert "gripper.pos" not in client.robot.sent_actions[-1]
+        assert fake_pika.instances[0].commands_mm == pytest.approx([40.0])
+        assert performed["gripper.pos"] == pytest.approx(0.04)
+    finally:
+        client.stop()
+
+
+def test_pose_act_piper_client_clamps_pika_gripper_action(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.robots.piper_follower import PiperFollowerConfig
+
+    fake_pika = _install_fake_pika(monkeypatch)
+    monkeypatch.setattr(
+        "lerobot.async_inference.robot_client.make_robot_from_config",
+        lambda config: _StubPoseActPiperRobot(),
+    )
+    client = RobotClient(
+        RobotClientConfig(
+            robot=PiperFollowerConfig(enable_on_connect=False, disable_on_disconnect=False),
+            server_address="localhost:9999",
+            policy_type="pose_act",
+            pretrained_name_or_path="test",
+            actions_per_chunk=3,
+            pika_gripper_max_width_m=0.03,
+        )
+    )
+
+    try:
+        action = torch.tensor([0.21, 0.02, 0.31, 0.0, 0.0, 0.0, 0.08], dtype=torch.float32)
+        client.action_queue.put(TimedAction(action=action, timestep=0, timestamp=time.time()))
+
+        performed = client.control_loop_action()
+
+        assert fake_pika.instances[0].commands_mm == pytest.approx([30.0])
+        assert performed["gripper.pos"] == pytest.approx(0.03)
+    finally:
+        client.stop()
+
+
+def test_pose_act_piper_client_can_use_legacy_piper_gripper(monkeypatch):
+    client = _make_pose_act_piper_client(monkeypatch, use_pika_gripper=False)
+    client.robot._joint_state["gripper.pos"] = 0.067
+
+    try:
+        pose = client._pose_act_adapter.current_pose7d()
+        action = client._action_tensor_to_action_dict(
+            torch.tensor([0.21, 0.02, 0.31, 0.0, 0.0, 0.0, 0.04], dtype=torch.float32)
+        )
+    finally:
+        client.stop()
+
+    assert pose[6].item() == pytest.approx(0.067)
+    assert action["gripper.pos"] == pytest.approx(0.04)
+
+
 def test_pose_act_piper_successful_send_marks_request_in_flight(monkeypatch):
     client = _make_pose_act_piper_client(monkeypatch)
     monkeypatch.setattr(client, "send_observation", lambda obs: True)
@@ -761,14 +925,14 @@ def test_pose_act_piper_client_sends_previous_and_current_frames(monkeypatch):
     try:
         client.control_loop_observation(task="test")
         first_obs = sent[-1].get_observation()
-        first_pose = first_obs[OBS_STATE][1].clone()
+        first_pose = torch.as_tensor(first_obs[OBS_STATE][1]).clone()
         client.robot._ee_state["x"] += 0.05
         client.control_loop_observation(task="test")
         second_obs = sent[-1].get_observation()
     finally:
         client.stop()
 
-    torch.testing.assert_close(second_obs[OBS_STATE][0], first_pose, rtol=0, atol=1e-6)
+    torch.testing.assert_close(torch.as_tensor(second_obs[OBS_STATE][0]), first_pose, rtol=0, atol=1e-6)
     assert second_obs[OBS_STATE][1, 0] > second_obs[OBS_STATE][0, 0]
     image_key = next(key for key in second_obs if key.startswith(f"{OBS_IMAGES}."))
     assert second_obs[image_key].shape[0] == 2
@@ -808,6 +972,7 @@ def test_pose_act_piper_client_sends_rgbd_history(monkeypatch):
             policy_type="pose_act",
             pretrained_name_or_path="test",
             actions_per_chunk=3,
+            use_pika_gripper=False,
         )
     )
     sent = []
@@ -912,19 +1077,19 @@ def test_pose_act_piper_client_handles_pose7d_response(monkeypatch):
     client = _make_pose_act_piper_client(monkeypatch)
 
     try:
-        action = client._action_tensor_to_action_dict(
-            torch.tensor([0.21, 0.02, 0.31, 0.0, 0.0, 0.0, 0.04], dtype=torch.float32)
-        )
+        tcp_pose = torch.tensor([0.21, 0.02, 0.31, 0.0, 0.0, 0.0, 0.04], dtype=torch.float32)
+        expected_ee_pose = client._pose_act_adapter.tcp_pose7d_to_ee_pose7d(tcp_pose)
+        action = client._action_tensor_to_action_dict(tcp_pose)
     finally:
         client.stop()
 
     assert action == {
-        "ee.abs_x": pytest.approx(0.21),
-        "ee.abs_y": pytest.approx(0.02),
-        "ee.abs_z": pytest.approx(0.1157),
-        "ee.abs_rx": pytest.approx(0.0),
-        "ee.abs_ry": pytest.approx(0.0),
-        "ee.abs_rz": pytest.approx(0.0),
+        "ee.abs_x": pytest.approx(float(expected_ee_pose[0].item())),
+        "ee.abs_y": pytest.approx(float(expected_ee_pose[1].item())),
+        "ee.abs_z": pytest.approx(float(expected_ee_pose[2].item())),
+        "ee.abs_rx": pytest.approx(float(expected_ee_pose[3].item())),
+        "ee.abs_ry": pytest.approx(float(expected_ee_pose[4].item())),
+        "ee.abs_rz": pytest.approx(float(expected_ee_pose[5].item())),
         "gripper.pos": pytest.approx(0.04),
     }
 

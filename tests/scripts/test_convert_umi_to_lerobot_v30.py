@@ -19,6 +19,7 @@ from lerobot.scripts.convert_umi_to_lerobot_v30 import (
     compute_aligned_length,
     convert_episode,
     convert_episodes,
+    detect_episode_arm_mode,
     discover_episode_dirs,
     discover_episode_files,
     euler_xyz_to_rotation_matrix,
@@ -131,6 +132,55 @@ def _make_episode(
         ("gripper/encoder/pika", "json"),
     ):
         (episode / directory / "sync.txt").write_text("\n".join(f"{stem}.{suffix}" for stem in synced_names))
+
+    return episode
+
+
+def _make_dual_arm_episode(
+    root: Path,
+    frames: int = 3,
+    episode_name: str = "episode1",
+) -> Path:
+    episode = root / episode_name
+    _write_json(episode / "instructions.json", {"full-instructions": ["pick up the object"]})
+    synced_names = []
+
+    for idx in range(frames):
+        timestamp = 1000.0 + idx / 30
+        stem = f"{timestamp:.6f}"
+        synced_names.append(stem)
+        for suffix, value_offset in (("l", 0), ("r", 100)):
+            value = value_offset + idx
+            _write_rgb(episode / f"camera/color/pikaDepthCamera_{suffix}" / f"{stem}.jpg", value=idx + value_offset + 1)
+            _write_rgb(episode / f"camera/color/pikaFisheyeCamera_{suffix}" / f"{stem}.jpg", value=idx + value_offset + 2)
+            _write_depth(episode / f"camera/depth/pikaDepthCamera_{suffix}" / f"{stem}.png", value=idx + value_offset + 100)
+            _write_json(
+                episode / f"localization/pose/pika_{suffix}" / f"{stem}.json",
+                {
+                    "x": value,
+                    "y": value + 1,
+                    "z": value + 2,
+                    "roll": value + 3,
+                    "pitch": value + 4,
+                    "yaw": value + 5,
+                },
+            )
+            _write_json(
+                episode / f"gripper/encoder/pika_{suffix}" / f"{stem}.json",
+                {"angle": value + 0.1, "distance": value + 0.2},
+            )
+
+    for suffix in ("l", "r"):
+        for directory, file_suffix in (
+            (f"camera/color/pikaDepthCamera_{suffix}", "jpg"),
+            (f"camera/color/pikaFisheyeCamera_{suffix}", "jpg"),
+            (f"camera/depth/pikaDepthCamera_{suffix}", "png"),
+            (f"localization/pose/pika_{suffix}", "json"),
+            (f"gripper/encoder/pika_{suffix}", "json"),
+        ):
+            (episode / directory / "sync.txt").write_text(
+                "\n".join(f"{stem}.{file_suffix}" for stem in synced_names)
+            )
 
     return episode
 
@@ -650,6 +700,106 @@ def test_discover_episode_files_finds_expected_modalities(tmp_path):
 
     assert set(files) == {"depth_camera_rgb", "fisheye_rgb", "depth_camera", "pose", "gripper"}
     assert all(len(paths) == 2 for paths in files.values())
+
+
+def test_detect_episode_arm_mode_distinguishes_single_and_dual_layouts(tmp_path):
+    single_episode = _make_episode(tmp_path / "single", frames=1)
+    dual_episode = _make_dual_arm_episode(tmp_path / "dual", frames=1)
+
+    assert detect_episode_arm_mode(single_episode) == "single"
+    assert detect_episode_arm_mode(dual_episode) == "dual"
+
+
+def test_discover_episode_files_selects_left_or_right_dual_arm_modalities(tmp_path):
+    episode = _make_dual_arm_episode(tmp_path, frames=2)
+
+    left_files = discover_episode_files(episode, cameras="fisheye_rgb,depth_camera", single_arm_side="left")
+    right_files = discover_episode_files(episode, cameras="fisheye_rgb,depth_camera", single_arm_side="right")
+
+    assert all("_l" in str(path.parent) for paths in left_files.values() for path in paths)
+    assert all("_r" in str(path.parent) for paths in right_files.values() for path in paths)
+
+
+def test_add_episode_to_dataset_uses_selected_dual_arm_side(tmp_path):
+    episode = _make_dual_arm_episode(tmp_path, frames=2)
+    dataset = _FakeDataset()
+
+    manifest = add_episode_to_dataset(dataset, episode, cameras="none", single_arm_side="right")
+
+    assert manifest["single_arm_side"] == "right"
+    assert len(dataset.frames) == 2
+    np.testing.assert_allclose(
+        dataset.frames[0]["observation.state"],
+        np.array([100, 101, 102, 103, 104, 105, 100.2], dtype=np.float32),
+    )
+    np.testing.assert_allclose(dataset.frames[0]["action"], dataset.frames[0]["observation.state"])
+
+
+def test_convert_episode_requires_side_for_dual_arm_input_single_arm_output(tmp_path):
+    episode = _make_dual_arm_episode(tmp_path, frames=1)
+
+    with pytest.raises(ValueError, match="requires --single-arm-side"):
+        convert_episode(episode, tmp_path / "output", cameras="none")
+
+
+def test_convert_episode_records_dual_input_single_output_side(tmp_path, monkeypatch):
+    import lerobot.datasets as datasets_module
+
+    episode = _make_dual_arm_episode(tmp_path, frames=1)
+
+    monkeypatch.setattr(datasets_module.LeRobotDataset, "create", staticmethod(lambda **kwargs: _FakeDataset()))
+
+    manifest = convert_episode(
+        episode,
+        tmp_path / "output",
+        repo_id="local/test-umi-dual-to-single",
+        cameras="none",
+        single_arm_side="left",
+    )
+
+    assert manifest["input_arm_mode"] == "dual"
+    assert manifest["output_arm_mode"] == "single"
+    assert manifest["single_arm_side"] == "left"
+    assert manifest["selected_frames"] == 1
+
+
+def test_convert_episodes_records_dual_input_single_output_side(tmp_path, monkeypatch):
+    import lerobot.datasets as datasets_module
+
+    input_root = tmp_path / "episodes"
+    _make_dual_arm_episode(input_root, frames=1, episode_name="episode_a")
+    _make_dual_arm_episode(input_root, frames=2, episode_name="episode_b")
+
+    monkeypatch.setattr(datasets_module.LeRobotDataset, "create", staticmethod(lambda **kwargs: _FakeDataset()))
+
+    manifest = convert_episodes(
+        input_root,
+        tmp_path / "output",
+        repo_id="local/test-umi-dual-batch",
+        cameras="none",
+        single_arm_side="right",
+    )
+
+    assert manifest["input_arm_mode"] == "dual"
+    assert manifest["output_arm_mode"] == "single"
+    assert manifest["single_arm_side"] == "right"
+    assert manifest["total_episodes"] == 2
+    assert manifest["total_selected_frames"] == 3
+    assert [item["single_arm_side"] for item in manifest["episodes"]] == ["right", "right"]
+
+
+@pytest.mark.parametrize("make_input", [_make_episode, _make_dual_arm_episode])
+def test_convert_episode_rejects_dual_arm_output_until_implemented(tmp_path, make_input):
+    episode = make_input(tmp_path, frames=1)
+
+    with pytest.raises(NotImplementedError, match="Dual-arm LeRobot output is not implemented"):
+        convert_episode(
+            episode,
+            tmp_path / "output",
+            cameras="none",
+            output_arm_mode="dual",
+            single_arm_side="left" if make_input is _make_dual_arm_episode else None,
+        )
 
 
 @pytest.mark.skipif(not SCIPY_AVAILABLE, reason="scipy extra required")
