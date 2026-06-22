@@ -11,7 +11,7 @@ from lerobot.policies.pose_act.processor_pose_act import (
     AbsolutePoseActionProcessorStep,
     RelativePoseActionProcessorStep,
 )
-from lerobot.policies.pose_act.utils import pose7d_to_pose10d, pose10d_to_pose7d
+from lerobot.policies.pose_act.utils import euler_rpy_to_matrix, pose7d_to_pose10d, pose10d_to_pose7d
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.feature_utils import infer_policy_feature_sets
 
@@ -181,6 +181,31 @@ def test_pose_act_rgbd_v2_forward_and_select_action():
     }
     action = policy.select_action(infer_batch)
     assert action.shape == (1, 10)
+
+
+def test_pose_act_euler_rpy_to_matrix_uses_rz_ry_rx_order():
+    rpy = torch.tensor([0.3, 0.2, 0.1], dtype=torch.float32)
+    roll, pitch, yaw = rpy
+    cr, sr = torch.cos(roll), torch.sin(roll)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+    rx = torch.stack((
+        torch.tensor([1.0, 0.0, 0.0]),
+        torch.stack((torch.tensor(0.0), cr, -sr)),
+        torch.stack((torch.tensor(0.0), sr, cr)),
+    ))
+    ry = torch.stack((
+        torch.stack((cp, torch.tensor(0.0), sp)),
+        torch.tensor([0.0, 1.0, 0.0]),
+        torch.stack((-sp, torch.tensor(0.0), cp)),
+    ))
+    rz = torch.stack((
+        torch.stack((cy, -sy, torch.tensor(0.0))),
+        torch.stack((sy, cy, torch.tensor(0.0))),
+        torch.tensor([0.0, 0.0, 1.0]),
+    ))
+
+    torch.testing.assert_close(euler_rpy_to_matrix(rpy), rz @ ry @ rx)
 
 
 def test_pose_act_pose7d_pose10d_roundtrip():
