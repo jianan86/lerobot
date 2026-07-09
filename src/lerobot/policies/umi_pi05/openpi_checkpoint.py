@@ -5,13 +5,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import torch
 
 from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    OBS_IMAGES,
+    OBS_STATE,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 from .configuration_umi_pi05 import UmiPI05Config
+from .processor_umi_pi05 import make_umi_pi05_pre_post_processors
 
 OPENPI_UMI_IMAGE_KEYS = (
     f"{OBS_IMAGES}.cam_high",
@@ -31,10 +39,19 @@ def is_openpi_umi_pi05_checkpoint(path: str | Path) -> bool:
     )
 
 
+def has_openpi_umi_pi05_files(path: str | Path) -> bool:
+    checkpoint = Path(path)
+    return (
+        checkpoint.is_dir()
+        and (checkpoint / "metadata.pt").exists()
+        and (checkpoint / "model.safetensors").exists()
+        and any(checkpoint.glob("assets/*/norm_stats.json"))
+    )
+
+
 def load_openpi_umi_pi05_config(path: str | Path, *, device: str | None = None) -> UmiPI05Config:
-    # Load metadata to catch corrupt/non-checkpoint directories early. The UMI runtime
-    # dimensions are fixed by the OpenPI bimanual Pika checkpoint contract.
-    torch.load(Path(path) / "metadata.pt", map_location="cpu", weights_only=False)
+    # The UMI runtime dimensions are fixed by the OpenPI bimanual Pika checkpoint contract.
+    # Do not unpickle metadata.pt here; OpenPI metadata can require Flax or JAX-only classes.
 
     config = UmiPI05Config(
         device=device,
@@ -58,11 +75,66 @@ def load_openpi_umi_pi05_stats(path: str | Path) -> dict[str, dict[str, torch.Te
     stats_path = _find_norm_stats_path(Path(path))
     with open(stats_path) as f:
         stats = json.load(f)
+    if "norm_stats" in stats:
+        stats = stats["norm_stats"]
 
     return {
         OBS_STATE: _convert_stats_entry(stats["state"]),
         ACTION: _convert_stats_entry(stats["actions"]),
     }
+
+
+def materialize_openpi_umi_pi05_checkpoint(
+    path: str | Path,
+    *,
+    device: str | None = "cpu",
+    overwrite: bool = False,
+) -> list[Path]:
+    checkpoint = Path(path)
+    if not has_openpi_umi_pi05_files(checkpoint):
+        raise FileNotFoundError(f"{checkpoint} does not look like an OpenPI UMI pi05 checkpoint.")
+
+    output_files = [
+        checkpoint / "config.json",
+        checkpoint / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+        checkpoint / f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+    ]
+    existing = [file for file in output_files if file.exists()]
+    if existing and not overwrite:
+        raise FileExistsError(
+            "LeRobot checkpoint files already exist. Pass overwrite=True to replace: "
+            + ", ".join(str(file) for file in existing)
+        )
+
+    config = load_openpi_umi_pi05_config(checkpoint, device=device)
+    stats = load_openpi_umi_pi05_stats(checkpoint)
+
+
+    class _TokenizerStub:
+        padding_side = "right"
+
+        def __call__(self, *_args, **_kwargs):
+            raise RuntimeError("Tokenizer is not used while materializing processor configs.")
+
+    config.save_pretrained(checkpoint)
+    with patch("lerobot.processor.tokenizer_processor.AutoTokenizer.from_pretrained", return_value=_TokenizerStub()):
+        preprocessor, postprocessor = make_umi_pi05_pre_post_processors(config, dataset_stats=stats)
+        preprocessor.save_pretrained(
+            checkpoint,
+            config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+        )
+        postprocessor.save_pretrained(
+            checkpoint,
+            config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+        )
+
+    return sorted(
+        [
+            *output_files,
+            *checkpoint.glob(f"{POLICY_PREPROCESSOR_DEFAULT_NAME}_step_*.safetensors"),
+            *checkpoint.glob(f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}_step_*.safetensors"),
+        ]
+    )
 
 
 def _find_norm_stats_path(path: Path) -> Path:

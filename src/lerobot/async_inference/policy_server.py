@@ -51,11 +51,6 @@ from lerobot.policies.pose_act.configuration_pose_act import (
     POSE_ACT_FISHEYE_RGB_KEY,
 )
 from lerobot.policies.pose_act.utils import pose7d_to_pose10d, pose10d_to_pose7d
-from lerobot.policies.umi_pi05 import (
-    is_openpi_umi_pi05_checkpoint,
-    load_openpi_umi_pi05_stats,
-    make_umi_pi05_pre_post_processors,
-)
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -415,22 +410,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
-        if self.policy_type == "umi_pi05" and is_openpi_umi_pi05_checkpoint(policy_specs.pretrained_name_or_path):
-            dataset_stats = load_openpi_umi_pi05_stats(policy_specs.pretrained_name_or_path)
-            self.preprocessor, self.postprocessor = make_umi_pi05_pre_post_processors(
-                self.policy.config,
-                dataset_stats=dataset_stats,
-            )
-        else:
-            self.preprocessor, self.postprocessor = make_pre_post_processors(
-                self.policy.config,
-                pretrained_path=policy_specs.pretrained_name_or_path,
-                preprocessor_overrides={
-                    "device_processor": device_override,
-                    "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-                },
-                postprocessor_overrides={"device_processor": device_override},
-            )
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            self.policy.config,
+            pretrained_path=policy_specs.pretrained_name_or_path,
+            preprocessor_overrides={
+                "device_processor": device_override,
+                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+            },
+            postprocessor_overrides={"device_processor": device_override},
+        )
 
         if self.config.inference_backend == "tensorrt":
             if getattr(self.policy.config, "use_rgbd_inputs", False):

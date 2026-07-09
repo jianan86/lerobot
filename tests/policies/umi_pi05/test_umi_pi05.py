@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
 from lerobot.policies.umi_pi05 import (
@@ -10,6 +11,7 @@ from lerobot.policies.umi_pi05 import (
     load_openpi_umi_pi05_config,
     load_openpi_umi_pi05_stats,
     make_umi_pi05_pre_post_processors,
+    materialize_openpi_umi_pi05_checkpoint,
 )
 from lerobot.processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
 from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
@@ -130,22 +132,21 @@ def test_openpi_umi_pi05_stats_mapping(tmp_path):
     torch.testing.assert_close(stats[ACTION]["q01"], torch.tensor([-1.0, -1.0]))
 
 
-def test_umi_pi05_from_pretrained_uses_openpi_config(monkeypatch, tmp_path):
+def test_materialize_openpi_umi_pi05_checkpoint_writes_lerobot_files(tmp_path):
     checkpoint = _write_openpi_checkpoint(tmp_path)
-    captured = {}
 
-    def fake_super_from_pretrained(cls, pretrained_name_or_path, **kwargs):
-        captured["path"] = pretrained_name_or_path
-        captured["config"] = kwargs["config"]
-        return "policy"
+    written = materialize_openpi_umi_pi05_checkpoint(checkpoint, device="cpu")
 
-    monkeypatch.setattr(
-        "lerobot.policies.pi05.modeling_pi05.PI05Policy.from_pretrained",
-        classmethod(fake_super_from_pretrained),
-    )
+    written_names = {path.name for path in written}
+    assert "config.json" in written_names
+    assert "policy_preprocessor.json" in written_names
+    assert "policy_postprocessor.json" in written_names
+    assert any(name.startswith("policy_preprocessor_step_") for name in written_names)
+    assert any(name.startswith("policy_postprocessor_step_") for name in written_names)
 
-    policy = UmiPI05Policy.from_pretrained(checkpoint)
+    config = PreTrainedConfig.from_pretrained(checkpoint)
+    assert config.input_features[OBS_STATE].shape == (20,)
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(checkpoint))
+    assert preprocessor.name == "policy_preprocessor"
+    assert postprocessor.name == "policy_postprocessor"
 
-    assert policy == "policy"
-    assert captured["path"] == checkpoint
-    assert isinstance(captured["config"], UmiPI05Config)
