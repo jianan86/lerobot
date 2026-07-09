@@ -60,6 +60,7 @@ from lerobot.transport.utils import receive_bytes_in_chunks
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import OBS_STATE
 
+from .adapters.umi_pi05_piper import relative_actions_to_absolute_tcp
 from .async_diagnostics import AsyncDiagnosticsWriter, chunk_intra_diff_stats
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -76,6 +77,8 @@ from .helpers import (
     resize_robot_observation_image,
 )
 from .tensorrt import PoseACTTensorRTPolicyAdapter
+
+UMI_PI05_ABSOLUTE_TCP_POSE7 = f"{OBS_STATE}.absolute_tcp_pose7"
 
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
@@ -834,6 +837,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation["task"] = raw_observation["task"]
         return observation
 
+    def _absolute_umi_pi05_action_chunk(
+        self, raw_observation: dict[str, Any], relative_action_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        if UMI_PI05_ABSOLUTE_TCP_POSE7 not in raw_observation:
+            raise ValueError(f"umi_pi05 async expects raw {UMI_PI05_ABSOLUTE_TCP_POSE7} shape (14,)")
+        base_pose = torch.as_tensor(raw_observation[UMI_PI05_ABSOLUTE_TCP_POSE7], dtype=torch.float32)
+        if base_pose.shape != (14,):
+            raise ValueError(
+                f"umi_pi05 async expects raw {UMI_PI05_ABSOLUTE_TCP_POSE7} shape (14,), "
+                f"got {tuple(base_pose.shape)}"
+            )
+        return relative_actions_to_absolute_tcp(relative_action_tensor, base_pose)
+
     def _predict_pose_act_pose7d_chunk(
         self, observation_t: TimedObservation, observation: Observation, start_prepare: float, prepare_time: float
     ) -> list[TimedAction]:
@@ -1132,6 +1148,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
+        if self.policy_type == "umi_pi05":
+            action_tensor = self._absolute_umi_pi05_action_chunk(raw_observation, action_tensor)
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(

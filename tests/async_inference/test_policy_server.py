@@ -234,6 +234,82 @@ def test_predict_action_chunk(monkeypatch, policy_server):
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
 
 
+def test_predict_umi_pi05_action_chunk_returns_absolute_tcp_pose7(monkeypatch):
+    from lerobot.async_inference.adapters.umi_pi05_piper import relative_actions_to_absolute_tcp
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.helpers import TimedObservation
+    from lerobot.async_inference.policy_server import UMI_PI05_ABSOLUTE_TCP_POSE7, PolicyServer
+
+    class UmiPolicyStub:
+        class _Config:
+            image_features = {}
+
+        config = _Config()
+
+    server = PolicyServer(PolicyServerConfig(host="localhost", port=9998))
+    server.policy_type = "umi_pi05"
+    server.policy = UmiPolicyStub()
+    server.actions_per_chunk = 2
+    server.device = "cpu"
+    captured = {}
+
+    def _fake_preprocessor(observation):
+        captured["keys"] = set(observation)
+        captured["state"] = observation[OBS_STATE].clone()
+        return observation
+
+    server.preprocessor = _fake_preprocessor
+    server.postprocessor = lambda tensor: tensor
+
+    relative_actions = torch.zeros(1, 2, 20, dtype=torch.float32)
+    relative_actions[:, :, 0] = 0.01
+    relative_actions[:, :, 11] = -0.02
+
+    def _fake_get_action_chunk(_self, _obs):
+        return relative_actions
+
+    monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
+
+    relative_state = torch.arange(20, dtype=torch.float32)
+    absolute_tcp_pose7 = torch.tensor(
+        [0.2, 0.0, 0.3, 0.1, -0.2, 0.3, 0.02, -0.2, 0.1, 0.25, -0.1, 0.2, -0.3, 0.03],
+        dtype=torch.float32,
+    )
+    obs = TimedObservation(
+        observation={
+            OBS_STATE: relative_state.numpy(),
+            UMI_PI05_ABSOLUTE_TCP_POSE7: absolute_tcp_pose7.numpy(),
+            "task": "pick",
+        },
+        timestamp=time.time(),
+        timestep=5,
+        must_go=True,
+    )
+
+    timed_actions = server._predict_action_chunk(obs)
+
+    assert len(timed_actions) == 2
+    assert timed_actions[0].get_action().shape == (14,)
+    expected = relative_actions_to_absolute_tcp(relative_actions.squeeze(0), absolute_tcp_pose7)
+    torch.testing.assert_close(torch.stack([action.get_action() for action in timed_actions]), expected)
+    torch.testing.assert_close(captured["state"], relative_state)
+    assert UMI_PI05_ABSOLUTE_TCP_POSE7 not in captured["keys"]
+
+
+def test_umi_pi05_absolute_action_chunk_requires_base_pose():
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.policy_server import UMI_PI05_ABSOLUTE_TCP_POSE7, PolicyServer
+
+    server = PolicyServer(PolicyServerConfig(host="localhost", port=9998))
+    relative_actions = torch.zeros(2, 20, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=UMI_PI05_ABSOLUTE_TCP_POSE7):
+        server._absolute_umi_pi05_action_chunk({}, relative_actions)
+
+    with pytest.raises(ValueError, match=r"shape \(14,\)"):
+        server._absolute_umi_pi05_action_chunk({UMI_PI05_ABSOLUTE_TCP_POSE7: torch.zeros(20)}, relative_actions)
+
+
 def test_predict_pose_act_pose7d_chunk(monkeypatch):
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.helpers import TimedObservation

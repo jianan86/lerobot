@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from lerobot.async_inference.adapters.pose_act_piper import PoseActPiperAdapter
-from lerobot.utils.pose_act import absolute_pose10d, pose7d_to_pose10d, pose10d_to_pose7d
+from lerobot.utils.pose_act import absolute_pose10d, pose7d_to_pose10d, pose10d_to_pose7d, relative_pose10d
 
 _IDENTITY_ROT6D = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=torch.float32)
 
@@ -22,19 +22,44 @@ def replace_zero_rot6d_with_identity(pose10d: Tensor, *, atol: float = 1e-8) -> 
     return pose
 
 
+def _pose7d_bimanual_to_pose10d(tcp_pose7_bimanual: Tensor) -> Tensor:
+    pose = tcp_pose7_bimanual.detach().to(torch.float32).cpu()
+    if pose.shape != (14,):
+        raise ValueError(f"Expected bimanual TCP pose7 shape (14,), got {tuple(pose.shape)}")
+    return torch.cat((pose7d_to_pose10d(pose[:7]), pose7d_to_pose10d(pose[7:])), dim=0)
+
+
+def build_relative_state(previous_tcp_pose7: Tensor, current_tcp_pose7: Tensor) -> Tensor:
+    """Build OpenPI UMI-style right-then-left relative observation.state."""
+    previous = previous_tcp_pose7.detach().to(torch.float32).cpu()
+    current = current_tcp_pose7.detach().to(torch.float32).cpu()
+    if previous.shape != (14,) or current.shape != (14,):
+        raise ValueError(
+            f"Expected previous/current bimanual TCP pose7 shapes (14,), got "
+            f"{tuple(previous.shape)} and {tuple(current.shape)}"
+        )
+
+    right = relative_pose10d(pose7d_to_pose10d(previous[:7]), pose7d_to_pose10d(current[:7]))
+    left = relative_pose10d(pose7d_to_pose10d(previous[7:]), pose7d_to_pose10d(current[7:]))
+    return torch.cat((right, left), dim=0)
+
+
 def relative_actions_to_absolute_tcp(relative_actions: Tensor, base_state: Tensor) -> Tensor:
     """Convert UMI bimanual relative TCP pose10 actions to absolute TCP pose7 actions.
 
     Args:
         relative_actions: Tensor shaped ``(T, 20)`` as right pose10 + left pose10.
-        base_state: Tensor shaped ``(20,)`` with current right pose10 + left pose10.
+        base_state: Tensor shaped ``(14,)`` with current absolute TCP pose7 or
+            ``(20,)`` with current right pose10 + left pose10.
     """
     actions = relative_actions.detach().to(torch.float32).cpu()
     state = base_state.detach().to(torch.float32).cpu()
     if actions.ndim != 2 or actions.shape[1] != 20:
         raise ValueError(f"Expected relative actions shape (T,20), got {tuple(actions.shape)}")
-    if state.shape != (20,):
-        raise ValueError(f"Expected base state shape (20,), got {tuple(state.shape)}")
+    if state.shape == (14,):
+        state = _pose7d_bimanual_to_pose10d(state)
+    elif state.shape != (20,):
+        raise ValueError(f"Expected base state shape (14,) or (20,), got {tuple(state.shape)}")
 
     right_rel = replace_zero_rot6d_with_identity(actions[:, :10])
     left_rel = replace_zero_rot6d_with_identity(actions[:, 10:])
@@ -82,6 +107,11 @@ class UmiPI05PiperAdapter:
     def current_tcp_pose10_state(self) -> Tensor:
         right = pose7d_to_pose10d(self.right.current_pose7d())
         left = pose7d_to_pose10d(self.left.current_pose7d())
+        return torch.cat((right, left), dim=0)
+
+    def current_tcp_pose7_state(self) -> Tensor:
+        right = self.right.current_pose7d()
+        left = self.left.current_pose7d()
         return torch.cat((right, left), dim=0)
 
     def tcp_pose7_to_ee_actions(self, tcp_pose7_bimanual: Tensor) -> tuple[dict[str, float], dict[str, float]]:
