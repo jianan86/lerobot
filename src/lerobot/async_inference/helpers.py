@@ -31,6 +31,7 @@ from lerobot.policies import (  # noqa: F401
     PI0Config,
     PI05Config,
     SmolVLAConfig,
+    UmiPI05Config,
     VQBeTConfig,
 )
 from lerobot.robots.robot import Robot

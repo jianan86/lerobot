@@ -29,6 +29,7 @@ from .sac.reward_model.configuration_classifier import RewardClassifierConfig as
 from .sarm.configuration_sarm import SARMConfig as SARMConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
+from .umi_pi05.configuration_umi_pi05 import UmiPI05Config as UmiPI05Config
 from .utils import make_robot_action, prepare_observation_for_inference
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
@@ -54,6 +55,7 @@ __all__ = [
     "SARMConfig",
     "SmolVLAConfig",
     "TDMPCConfig",
+    "UmiPI05Config",
     "VQBeTConfig",
     "WallXConfig",
     "XVLAConfig",

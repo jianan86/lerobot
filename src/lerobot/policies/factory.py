@@ -58,6 +58,7 @@ from .sac.reward_model.configuration_classifier import RewardClassifierConfig
 from .sarm.configuration_sarm import SARMConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
+from .umi_pi05.configuration_umi_pi05 import UmiPI05Config
 from .utils import validate_visual_features_consistency
 from .vqbet.configuration_vqbet import VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig
@@ -147,6 +148,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "umi_pi05":
+        from .umi_pi05.modeling_umi_pi05 import UmiPI05Policy
+
+        return UmiPI05Policy
     elif name == "sac":
         from .sac.modeling_sac import SACPolicy
 
@@ -219,6 +224,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "umi_pi05":
+        return UmiPI05Config(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
@@ -388,6 +395,14 @@ def make_pre_post_processors(
         from .pi0.processor_pi0 import make_pi0_pre_post_processors
 
         processors = make_pi0_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, UmiPI05Config):
+        from .umi_pi05.processor_umi_pi05 import make_umi_pi05_pre_post_processors
+
+        processors = make_umi_pi05_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

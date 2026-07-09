@@ -274,6 +274,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         )
         processor_pretrained_path = None
 
+    if cfg.policy.type == "umi_pi05" and processor_pretrained_path is not None and not cfg.resume:
+        logging.warning(
+            "umi_pi05 checkpoints converted from OpenPI do not contain LeRobot processor configs. "
+            "Building processors from current policy config."
+        )
+        processor_pretrained_path = None
+
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}

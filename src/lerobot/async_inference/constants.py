@@ -31,6 +31,7 @@ SUPPORTED_POLICIES = [
     "vqbet",
     "pi0",
     "pi05",
+    "umi_pi05",
     "groot",
     "pose_act",
     "pose_smolvla",
