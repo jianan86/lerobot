@@ -1,11 +1,19 @@
 import pytest
+import torch
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
-from lerobot.policies.umi_pi05 import UmiPI05Config, UmiPI05Policy, make_umi_pi05_pre_post_processors
+from lerobot.policies.umi_pi05 import (
+    UmiPI05Config,
+    UmiPI05Policy,
+    is_openpi_umi_pi05_checkpoint,
+    load_openpi_umi_pi05_config,
+    load_openpi_umi_pi05_stats,
+    make_umi_pi05_pre_post_processors,
+)
 from lerobot.processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
 from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 
 class _DummyTokenizer:
@@ -75,3 +83,69 @@ def test_umi_pi05_uses_last_action_shape_dim():
     policy.config = config
 
     assert policy._original_action_dim() == 20
+
+
+def _write_openpi_checkpoint(tmp_path):
+    checkpoint = tmp_path / "openpi"
+    stats_dir = checkpoint / "assets" / "pika"
+    stats_dir.mkdir(parents=True)
+    (checkpoint / "model.safetensors").write_bytes(b"stub")
+    torch.save({"config": "stub"}, checkpoint / "metadata.pt")
+    (stats_dir / "norm_stats.json").write_text(
+        """
+        {
+          "state": {"p01": [0.0, 0.0], "p99": [1.0, 1.0]},
+          "actions": {"q01": [-1.0, -1.0], "q99": [1.0, 1.0]}
+        }
+        """
+    )
+    return checkpoint
+
+
+def test_openpi_umi_pi05_checkpoint_detection_and_config(tmp_path):
+    checkpoint = _write_openpi_checkpoint(tmp_path)
+
+    assert is_openpi_umi_pi05_checkpoint(checkpoint)
+    config = load_openpi_umi_pi05_config(checkpoint, device="cpu")
+
+    assert isinstance(config, UmiPI05Config)
+    assert config.chunk_size == 10
+    assert config.input_features[OBS_STATE].shape == (20,)
+    assert config.output_features[ACTION].shape == (10, 20)
+    assert set(config.image_features) == {
+        f"{OBS_IMAGES}.cam_high",
+        f"{OBS_IMAGES}.cam_left_wrist",
+        f"{OBS_IMAGES}.cam_right_wrist",
+    }
+
+
+def test_openpi_umi_pi05_stats_mapping(tmp_path):
+    checkpoint = _write_openpi_checkpoint(tmp_path)
+
+    stats = load_openpi_umi_pi05_stats(checkpoint)
+
+    assert set(stats) == {OBS_STATE, ACTION}
+    torch.testing.assert_close(stats[OBS_STATE]["q01"], torch.tensor([0.0, 0.0]))
+    torch.testing.assert_close(stats[OBS_STATE]["q99"], torch.tensor([1.0, 1.0]))
+    torch.testing.assert_close(stats[ACTION]["q01"], torch.tensor([-1.0, -1.0]))
+
+
+def test_umi_pi05_from_pretrained_uses_openpi_config(monkeypatch, tmp_path):
+    checkpoint = _write_openpi_checkpoint(tmp_path)
+    captured = {}
+
+    def fake_super_from_pretrained(cls, pretrained_name_or_path, **kwargs):
+        captured["path"] = pretrained_name_or_path
+        captured["config"] = kwargs["config"]
+        return "policy"
+
+    monkeypatch.setattr(
+        "lerobot.policies.pi05.modeling_pi05.PI05Policy.from_pretrained",
+        classmethod(fake_super_from_pretrained),
+    )
+
+    policy = UmiPI05Policy.from_pretrained(checkpoint)
+
+    assert policy == "policy"
+    assert captured["path"] == checkpoint
+    assert isinstance(captured["config"], UmiPI05Config)

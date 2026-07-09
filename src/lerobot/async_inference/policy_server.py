@@ -51,6 +51,11 @@ from lerobot.policies.pose_act.configuration_pose_act import (
     POSE_ACT_FISHEYE_RGB_KEY,
 )
 from lerobot.policies.pose_act.utils import pose7d_to_pose10d, pose10d_to_pose7d
+from lerobot.policies.umi_pi05 import (
+    is_openpi_umi_pi05_checkpoint,
+    load_openpi_umi_pi05_stats,
+    make_umi_pi05_pre_post_processors,
+)
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -406,18 +411,26 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         start = time.perf_counter()
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
         self.policy.to(self.device)
+        self.policy.config.device = self.device
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.policy.config,
-            pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
-            postprocessor_overrides={"device_processor": device_override},
-        )
+        if self.policy_type == "umi_pi05" and is_openpi_umi_pi05_checkpoint(policy_specs.pretrained_name_or_path):
+            dataset_stats = load_openpi_umi_pi05_stats(policy_specs.pretrained_name_or_path)
+            self.preprocessor, self.postprocessor = make_umi_pi05_pre_post_processors(
+                self.policy.config,
+                dataset_stats=dataset_stats,
+            )
+        else:
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                self.policy.config,
+                pretrained_path=policy_specs.pretrained_name_or_path,
+                preprocessor_overrides={
+                    "device_processor": device_override,
+                    "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                },
+                postprocessor_overrides={"device_processor": device_override},
+            )
 
         if self.config.inference_backend == "tensorrt":
             if getattr(self.policy.config, "use_rgbd_inputs", False):
@@ -819,6 +832,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation["task"] = raw_observation["task"]
         return observation
 
+    def _is_umi_pi05_native_observation(self, raw_observation: dict[str, Any]) -> bool:
+        return self.policy_type == "umi_pi05" and OBS_STATE in raw_observation
+
+    def _raw_umi_pi05_observation_to_observation(self, raw_observation: dict[str, Any]) -> Observation:
+        observation: Observation = {OBS_STATE: torch.as_tensor(raw_observation[OBS_STATE], dtype=torch.float32)}
+        for key, feature in self.policy.config.image_features.items():
+            image = torch.as_tensor(raw_observation[key])
+            if image.ndim != 3:
+                raise ValueError(f"umi_pi05 async expects raw image {key} shape (H,W,C), got {tuple(image.shape)}")
+            observation[key] = prepare_image(resize_robot_observation_image(image, feature.shape))
+        if "task" in raw_observation:
+            observation["task"] = raw_observation["task"]
+        return observation
+
     def _predict_pose_act_pose7d_chunk(
         self, observation_t: TimedObservation, observation: Observation, start_prepare: float, prepare_time: float
     ) -> list[TimedAction]:
@@ -1065,8 +1092,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
+        raw_observation = observation_t.get_observation()
         if self._is_pose_policy():
-            observation = self._raw_pose_act_observation_to_observation(observation_t.get_observation())
+            observation = self._raw_pose_act_observation_to_observation(raw_observation)
+        elif self._is_umi_pi05_native_observation(raw_observation):
+            observation = self._raw_umi_pi05_observation_to_observation(raw_observation)
         else:
             observation = raw_observation_to_observation(
                 observation_t.get_observation(),

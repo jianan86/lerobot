@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 
-from typing import Unpack
+import builtins
+from pathlib import Path
+from typing import TypeVar, Unpack
 
 import torch
 from torch import Tensor
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -13,6 +16,9 @@ from lerobot.utils.constants import (
 
 from ..pi05.modeling_pi05 import ActionSelectKwargs, PI05Policy
 from .configuration_umi_pi05 import UmiPI05Config
+from .openpi_checkpoint import is_openpi_umi_pi05_checkpoint, load_openpi_umi_pi05_config
+
+T = TypeVar("T", bound="UmiPI05Policy")
 
 
 class UmiPI05Policy(PI05Policy):
@@ -20,6 +26,42 @@ class UmiPI05Policy(PI05Policy):
 
     config_class = UmiPI05Config
     name = "umi_pi05"
+
+    @classmethod
+    def from_pretrained(
+        cls: builtins.type[T],
+        pretrained_name_or_path: str | Path,
+        *,
+        config: PreTrainedConfig | None = None,
+        force_download: bool = False,
+        resume_download: bool | None = None,
+        proxies: dict | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
+        revision: str | None = None,
+        strict: bool = True,
+        **kwargs,
+    ) -> T:
+        if config is None and is_openpi_umi_pi05_checkpoint(pretrained_name_or_path):
+            config = load_openpi_umi_pi05_config(
+                pretrained_name_or_path,
+                device=kwargs.get("device"),
+            )
+
+        return super().from_pretrained(
+            pretrained_name_or_path,
+            config=config,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            revision=revision,
+            strict=strict,
+            **kwargs,
+        )
 
     def _original_action_dim(self) -> int:
         action_shape = self.config.output_features[ACTION].shape
