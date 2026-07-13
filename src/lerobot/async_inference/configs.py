@@ -153,6 +153,20 @@ class PolicyServerConfig:
             "async_loop_events.jsonl timing events."
         },
     )
+    first_observation_dump_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional directory where the first raw client observation is dumped. "
+            "Includes state, task, metadata, raw payload, and observation images."
+        },
+    )
+    tokenizer_name_or_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional local path or Hub name overriding the preprocessor's tokenizer_processor "
+            "tokenizer_name, e.g. to load a PaliGemma tokenizer from local disk instead of the Hub."
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -177,6 +191,12 @@ class PolicyServerConfig:
         if self.diagnostics_dump_dir is not None and not str(self.diagnostics_dump_dir).strip():
             raise ValueError("diagnostics_dump_dir cannot be an empty string")
 
+        if self.first_observation_dump_dir is not None and not str(self.first_observation_dump_dir).strip():
+            raise ValueError("first_observation_dump_dir cannot be an empty string")
+
+        if self.tokenizer_name_or_path is not None and not str(self.tokenizer_name_or_path).strip():
+            raise ValueError("tokenizer_name_or_path cannot be an empty string")
+
         if self.inference_backend not in {"torch", "tensorrt"}:
             raise ValueError(
                 f"inference_backend must be one of ['torch', 'tensorrt'], got {self.inference_backend!r}"
@@ -194,6 +214,12 @@ class PolicyServerConfig:
         if self.result_dump_dir is None:
             return None
         return Path(self.result_dump_dir)
+
+    @property
+    def first_observation_dump_path(self) -> Path | None:
+        if self.first_observation_dump_dir is None:
+            return None
+        return Path(self.first_observation_dump_dir)
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":

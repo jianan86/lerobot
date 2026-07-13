@@ -24,6 +24,7 @@ python -m lerobot.async_inference.policy_server \
 ```
 """
 
+import json
 import logging
 import math
 import pickle  # nosec
@@ -43,6 +44,7 @@ import draccus
 import grpc
 import numpy as np
 import torch
+from PIL import Image
 
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.pose_act.configuration_pose_act import (
@@ -93,6 +95,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._result_dump_root = config.result_dump_path
         if self._result_dump_root is not None:
             self._result_dump_root.mkdir(parents=True, exist_ok=True)
+        self._first_observation_dump_root = config.first_observation_dump_path
+        if self._first_observation_dump_root is not None:
+            self._first_observation_dump_root.mkdir(parents=True, exist_ok=True)
+        self._first_observation_dump_lock = threading.Lock()
+        self._first_observation_dumped = False
 
         self._diagnostics = AsyncDiagnosticsWriter(config.effective_diagnostics_dump_dir)
 
@@ -147,6 +154,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self._shell_step_count = 0
         self._shell_t0 = None
+        self._first_observation_dumped = False
 
     def _start_pose_act_visualizer(self) -> None:
         if self._pose_act_vis_process is not None:
@@ -352,6 +360,128 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         pad = target_width - frame.shape[1]
         return np.pad(frame, ((0, 0), (0, pad), (0, 0)), mode="constant", constant_values=0)
 
+    def _dump_first_observation(self, timed_observation: TimedObservation) -> None:
+        dump_root = self._first_observation_dump_root
+        if dump_root is None:
+            return
+        with self._first_observation_dump_lock:
+            if self._first_observation_dumped:
+                return
+            self._first_observation_dumped = True
+
+        raw_observation = timed_observation.get_observation()
+        dump_dir = dump_root / f"ts-{timed_observation.get_timestep():06d}"
+        images_dir = dump_dir / "images"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        torch.save(
+            {
+                "timestamp": timed_observation.get_timestamp(),
+                "timestep": timed_observation.get_timestep(),
+                "must_go": timed_observation.must_go,
+                "observation": raw_observation,
+            },
+            dump_dir / "raw_observation.pt",
+        )
+
+        state = raw_observation.get(OBS_STATE)
+        if state is None and all(k in raw_observation for k in ("x", "y", "z", "roll", "pitch", "yaw", "gripper_width")):
+            state = torch.tensor(
+                [
+                    raw_observation["x"],
+                    raw_observation["y"],
+                    raw_observation["z"],
+                    raw_observation["roll"],
+                    raw_observation["pitch"],
+                    raw_observation["yaw"],
+                    raw_observation["gripper_width"],
+                ],
+                dtype=torch.float32,
+            )
+        if state is not None:
+            torch.save(torch.as_tensor(state).detach().cpu(), dump_dir / "state.pt")
+
+        task = raw_observation.get("task")
+        if task is not None:
+            (dump_dir / "task.txt").write_text(str(task), encoding="utf-8")
+
+        image_files: dict[str, list[str]] = {}
+        for key, value in raw_observation.items():
+            if not self._is_observation_image_value(value):
+                continue
+            saved = self._save_observation_image_value(images_dir, key, value)
+            if saved:
+                image_files[key] = [str(saved_path.relative_to(dump_dir)) for saved_path in saved]
+
+        metadata = {
+            "timestamp": timed_observation.get_timestamp(),
+            "timestep": timed_observation.get_timestep(),
+            "must_go": timed_observation.must_go,
+            "policy_type": self.policy_type,
+            "device": self.device,
+            "keys": {key: self._summarize_observation_value(value) for key, value in raw_observation.items()},
+            "image_files": image_files,
+            "state_file": "state.pt" if state is not None else None,
+            "task_file": "task.txt" if task is not None else None,
+            "raw_observation_file": "raw_observation.pt",
+        }
+        (dump_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        self.logger.info(f"Dumped first client observation to {dump_dir}")
+
+    def _is_observation_image_value(self, value: Any) -> bool:
+        shape = getattr(value, "shape", None)
+        ndim = getattr(value, "ndim", None)
+        return shape is not None and ndim in (2, 3, 4)
+
+    def _save_observation_image_value(self, images_dir: Path, key: str, value: Any) -> list[Path]:
+        array = torch.as_tensor(value).detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+        stem = self._safe_dump_stem(key)
+        saved: list[Path] = []
+        if array.ndim == 4:
+            for idx in range(array.shape[0]):
+                image = self._observation_image_to_uint8(array[idx])
+                path = images_dir / f"{stem}_{idx:02d}.png"
+                Image.fromarray(image).save(path)
+                saved.append(path)
+            return saved
+
+        image = self._observation_image_to_uint8(array)
+        path = images_dir / f"{stem}.png"
+        Image.fromarray(image).save(path)
+        return [path]
+
+    def _observation_image_to_uint8(self, image: np.ndarray) -> np.ndarray:
+        array = np.asarray(image)
+        if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+            array = np.transpose(array, (1, 2, 0))
+        if array.ndim == 3 and array.shape[-1] == 1:
+            array = array[..., 0]
+        if array.ndim not in (2, 3):
+            raise ValueError(f"expected image ndim 2 or 3, got shape {tuple(array.shape)}")
+        if np.issubdtype(array.dtype, np.floating):
+            finite = array[np.isfinite(array)]
+            if finite.size and float(finite.min()) >= 0.0 and float(finite.max()) <= 1.0:
+                array = array * 255.0
+        if array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(array)
+
+    def _safe_dump_stem(self, key: str) -> str:
+        return "".join(c if c.isalnum() or c in "._-" else "_" for c in key)
+
+    def _summarize_observation_value(self, value: Any) -> dict[str, Any]:
+        summary = {"type": type(value).__name__}
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            summary["shape"] = list(shape)
+        dtype = getattr(value, "dtype", None)
+        if dtype is not None:
+            summary["dtype"] = str(dtype)
+        return summary
+
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
         self.logger.info(f"Client {client_id} connected and ready")
@@ -406,24 +536,43 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         policy_class = get_policy_class(self.policy_type)
 
-        start = time.perf_counter()
+        overall_start = time.perf_counter()
+
+        step_start = time.perf_counter()
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        self.logger.info(
+            f"[load] from_pretrained (read config + checkpoint weights, build model): "
+            f"{time.perf_counter() - step_start:.4f}s"
+        )
+
+        step_start = time.perf_counter()
         self.policy.to(self.device)
         self.policy.config.device = self.device
+        self.logger.info(f"[load] policy.to({self.device}): {time.perf_counter() - step_start:.4f}s")
 
         # Load preprocessor and postprocessor, overriding device to match requested device
+        step_start = time.perf_counter()
         device_override = {"device": self.device}
+        preprocessor_overrides = {
+            "device_processor": device_override,
+            "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+        }
+        if self.config.tokenizer_name_or_path is not None:
+            preprocessor_overrides["tokenizer_processor"] = {
+                "tokenizer_name": self.config.tokenizer_name_or_path
+            }
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
+            preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": device_override},
+        )
+        self.logger.info(
+            f"[load] make_pre_post_processors (incl. tokenizer): {time.perf_counter() - step_start:.4f}s"
         )
 
         if self.config.inference_backend == "tensorrt":
+            step_start = time.perf_counter()
             if getattr(self.policy.config, "use_rgbd_inputs", False):
                 raise ValueError("TensorRT backend does not support pose_act RGBD inputs yet.")
             engine_path = Path(policy_specs.pretrained_name_or_path) / "model.engine"
@@ -433,12 +582,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 build_engine=self.config.tensorrt_build_engine,
                 fp16=self.config.tensorrt_fp16,
             )
-
-        end = time.perf_counter()
+            self.logger.info(f"[load] tensorrt adapter build: {time.perf_counter() - step_start:.4f}s")
 
         self.logger.info(
             f"Time taken to put policy on {self.device} "
-            f"(backend={self.config.inference_backend}): {end - start:.4f} seconds"
+            f"(backend={self.config.inference_backend}): {time.perf_counter() - overall_start:.4f} seconds"
         )
 
         return services_pb2.Empty()
@@ -475,6 +623,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         deserialize_time = time.perf_counter() - start_deserialize
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
+        self._dump_first_observation(timed_observation)
         if self._is_pose_policy():
             self._publish_pose_act_visualization(timed_observation)
 

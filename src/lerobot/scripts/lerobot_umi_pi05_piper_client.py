@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-from __future__ import annotations
-
 import json
 import pickle  # nosec
 import socket
@@ -24,7 +22,11 @@ from lerobot.async_inference.adapters import (
     build_relative_state,
 )
 from lerobot.async_inference.helpers import RemotePolicyConfig, TimedObservation
-from lerobot.robots import RobotConfig, make_robot_from_config
+from lerobot.robots import (
+    RobotConfig,
+    make_robot_from_config,
+    piper_follower,  # noqa: F401
+)
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import send_bytes_in_chunks
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
@@ -62,6 +64,8 @@ class UmiPI05PiperClientConfig:
     max_rpy_step: float = 0.35
     max_gripper_step: float = 0.005
     gripper_close_threshold: float = 0.04
+    dry_run_actions: bool = False
+    max_steps: int | None = None
 
 
 def _free_port() -> int:
@@ -85,8 +89,18 @@ def _start_tunnel(cfg: UmiPI05PiperClientConfig) -> tuple[str, subprocess.Popen[
             cfg.ssh_host,
         ]
     )
-    time.sleep(0.5)
-    return f"127.0.0.1:{local_port}", proc
+    address = f"127.0.0.1:{local_port}"
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"SSH tunnel exited early with code {proc.returncode}.")
+        try:
+            with socket.create_connection(("127.0.0.1", local_port), timeout=0.2):
+                return address, proc
+        except OSError:
+            time.sleep(0.05)
+    proc.terminate()
+    raise TimeoutError(f"Timed out waiting for SSH tunnel on {address}.")
 
 
 @dataclass(frozen=True)
@@ -221,6 +235,14 @@ class UmiPI05PikaGripper:
         self.fisheye: Any | None = None
 
     def connect(self) -> None:
+        try:
+            import cv2
+
+            if not hasattr(cv2, "setLogLevel"):
+                cv2.setLogLevel = lambda *_args, **_kwargs: None
+        except ImportError:
+            pass
+
         try:
             from pika.gripper import Gripper
         except ImportError as e:
@@ -399,6 +421,71 @@ def _get_actions(stub) -> list:
     return pickle.loads(response.data)  # nosec
 
 
+def _send_bimanual_target(
+    adapter: UmiPI05PiperAdapter,
+    target: torch.Tensor,
+    cfg: UmiPI05PiperClientConfig,
+    right_robot,
+    left_robot,
+    right_gripper,
+    left_gripper,
+) -> None:
+    right_action, left_action = adapter.tcp_pose7_to_ee_actions(target)
+    right_width = right_action.pop("gripper.pos", None)
+    left_width = left_action.pop("gripper.pos", None)
+    if cfg.dry_run_actions:
+        return
+
+    right_robot.send_action(right_action)
+    if cfg.arm_mode == "dual":
+        left_robot.send_action(left_action)
+    if right_gripper is not None and right_width is not None:
+        right_gripper.execute_width(right_width)
+    if cfg.arm_mode == "dual" and left_gripper is not None and left_width is not None:
+        left_gripper.execute_width(left_width)
+
+
+def _execute_tcp_action_chunk(
+    tcp_actions: torch.Tensor,
+    last_target: torch.Tensor,
+    cfg: UmiPI05PiperClientConfig,
+    adapter: UmiPI05PiperAdapter,
+    right_robot,
+    left_robot,
+    right_gripper,
+    left_gripper,
+    *,
+    dt: float,
+    executed_steps: int,
+    sleep_fn=time.sleep,
+    perf_counter=time.perf_counter,
+) -> tuple[torch.Tensor, int]:
+    for action_index, raw_target in enumerate(tcp_actions):
+        if cfg.max_steps is not None and executed_steps >= cfg.max_steps:
+            break
+
+        action_start = perf_counter()
+        target = _limit_bimanual_target(last_target, raw_target, cfg)
+        _send_bimanual_target(
+            adapter,
+            target,
+            cfg,
+            right_robot,
+            left_robot,
+            right_gripper,
+            left_gripper,
+        )
+        last_target = target
+        executed_steps += 1
+
+        has_next_action = action_index < len(tcp_actions) - 1
+        below_step_limit = cfg.max_steps is None or executed_steps < cfg.max_steps
+        if has_next_action and below_step_limit:
+            sleep_fn(max(0.0, dt - (perf_counter() - action_start)))
+
+    return last_target, executed_steps
+
+
 @draccus.wrap()
 def run(cfg: UmiPI05PiperClientConfig) -> None:
     init_logging()
@@ -411,25 +498,14 @@ def run(cfg: UmiPI05PiperClientConfig) -> None:
     right_pika_port, right_fisheye, left_pika_port, left_fisheye = _resolve_pika_devices(cfg)
 
     address, tunnel = _start_tunnel(cfg)
-    right_robot = make_robot_from_config(cfg.right_robot)
-    left_robot = make_robot_from_config(cfg.left_robot) if cfg.arm_mode == "dual" else right_robot
-    right_gripper = _setup_gripper(right_pika_port, cfg, fisheye_device=right_fisheye)
-    left_gripper = (
-        _setup_gripper(left_pika_port, cfg, fisheye_device=left_fisheye)
-        if cfg.arm_mode == "dual"
-        else right_gripper
-    )
-
     channel = grpc.insecure_channel(address)
     stub = services_pb2_grpc.AsyncInferenceStub(channel)
-    adapter = UmiPI05PiperAdapter(
-        right_robot, left_robot, right_gripper=right_gripper, left_gripper=left_gripper
-    )
+    right_robot = None
+    left_robot = None
+    right_gripper = None
+    left_gripper = None
 
     try:
-        right_robot.connect()
-        if cfg.arm_mode == "dual":
-            left_robot.connect()
         stub.Ready(services_pb2.Empty())
         policy_config = RemotePolicyConfig(
             policy_type="umi_pi05",
@@ -440,11 +516,27 @@ def run(cfg: UmiPI05PiperClientConfig) -> None:
         )
         stub.SendPolicyInstructions(services_pb2.PolicySetup(data=pickle.dumps(policy_config)))  # nosec
 
+        right_robot = make_robot_from_config(cfg.right_robot)
+        left_robot = make_robot_from_config(cfg.left_robot) if cfg.arm_mode == "dual" else right_robot
+        right_gripper = _setup_gripper(right_pika_port, cfg, fisheye_device=right_fisheye)
+        left_gripper = (
+            _setup_gripper(left_pika_port, cfg, fisheye_device=left_fisheye)
+            if cfg.arm_mode == "dual"
+            else right_gripper
+        )
+        adapter = UmiPI05PiperAdapter(
+            right_robot, left_robot, right_gripper=right_gripper, left_gripper=left_gripper
+        )
+        right_robot.connect()
+        if cfg.arm_mode == "dual":
+            left_robot.connect()
+
         timestep = 0
         dt = 1.0 / cfg.fps
         previous_tcp_pose = adapter.current_tcp_pose7_state()
         last_target = previous_tcp_pose.clone()
-        while True:
+        executed_steps = 0
+        while cfg.max_steps is None or executed_steps < cfg.max_steps:
             start = time.perf_counter()
             current_tcp_pose = adapter.current_tcp_pose7_state()
             state = build_relative_state(previous_tcp_pose, current_tcp_pose)
@@ -469,25 +561,27 @@ def run(cfg: UmiPI05PiperClientConfig) -> None:
                     tcp_actions,
                     close_threshold=cfg.gripper_close_threshold,
                 )
-                target = _limit_bimanual_target(last_target, tcp_actions[0], cfg)
-                right_action, left_action = adapter.tcp_pose7_to_ee_actions(target)
-                right_width = right_action.pop("gripper.pos", None)
-                left_width = left_action.pop("gripper.pos", None)
-                right_robot.send_action(right_action)
-                if cfg.arm_mode == "dual":
-                    left_robot.send_action(left_action)
-                if right_gripper is not None and right_width is not None:
-                    right_gripper.execute_width(right_width)
-                if cfg.arm_mode == "dual" and left_gripper is not None and left_width is not None:
-                    left_gripper.execute_width(left_width)
-                last_target = target
+                last_target, executed_steps = _execute_tcp_action_chunk(
+                    tcp_actions,
+                    last_target,
+                    cfg,
+                    adapter,
+                    right_robot,
+                    left_robot,
+                    right_gripper,
+                    left_gripper,
+                    dt=dt,
+                    executed_steps=executed_steps,
+                )
 
             previous_tcp_pose = current_tcp_pose
             timestep += 1
-            time.sleep(max(0.0, dt - (time.perf_counter() - start)))
+            if not timed_actions:
+                time.sleep(max(0.0, dt - (time.perf_counter() - start)))
     finally:
-        right_robot.disconnect()
-        if cfg.arm_mode == "dual":
+        if right_robot is not None:
+            right_robot.disconnect()
+        if cfg.arm_mode == "dual" and left_robot is not None:
             left_robot.disconnect()
         if right_gripper is not None:
             right_gripper.disconnect()

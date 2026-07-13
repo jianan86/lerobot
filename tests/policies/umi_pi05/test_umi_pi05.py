@@ -1,9 +1,11 @@
 import pytest
 import torch
+from torch import nn
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
+from lerobot.policies.pi05.modeling_pi05 import PaliGemmaWithExpertModel
 from lerobot.policies.umi_pi05 import (
     UmiPI05Config,
     UmiPI05Policy,
@@ -87,6 +89,42 @@ def test_umi_pi05_uses_last_action_shape_dim():
     assert policy._original_action_dim() == 20
 
 
+class _DummyPaliGemma(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Linear(2, 2)
+        self.model.vision_tower = nn.Linear(2, 2)
+        self.multi_modal_projector = nn.Linear(2, 2)
+        self.lm_head = nn.Linear(2, 2, bias=False)
+
+
+def test_umi_pi05_freeze_language_model_keeps_vision_trainable():
+    model = PaliGemmaWithExpertModel.__new__(PaliGemmaWithExpertModel)
+    nn.Module.__init__(model)
+    model.freeze_vision_encoder = False
+    model.freeze_language_model = True
+    model.train_expert_only = False
+    model.paligemma = _DummyPaliGemma()
+    model.gemma_expert = nn.Linear(2, 2)
+
+    model._set_requires_grad()
+
+    assert not any(p.requires_grad for p in model.paligemma.model.language_model.parameters())
+    assert not any(p.requires_grad for p in model.paligemma.lm_head.parameters())
+    assert any(p.requires_grad for p in model.paligemma.model.vision_tower.parameters())
+    assert any(p.requires_grad for p in model.paligemma.multi_modal_projector.parameters())
+    assert any(p.requires_grad for p in model.gemma_expert.parameters())
+
+    model.train()
+
+    assert not model.paligemma.model.language_model.training
+    assert not model.paligemma.lm_head.training
+    assert model.paligemma.model.vision_tower.training
+    assert model.paligemma.multi_modal_projector.training
+    assert model.gemma_expert.training
+
+
 def _write_openpi_checkpoint(tmp_path):
     checkpoint = tmp_path / "openpi"
     stats_dir = checkpoint / "assets" / "pika"
@@ -112,6 +150,7 @@ def test_openpi_umi_pi05_checkpoint_detection_and_config(tmp_path):
 
     assert isinstance(config, UmiPI05Config)
     assert config.chunk_size == 10
+    assert config.dtype == "bfloat16"
     assert config.input_features[OBS_STATE].shape == (20,)
     assert config.output_features[ACTION].shape == (10, 20)
     assert set(config.image_features) == {

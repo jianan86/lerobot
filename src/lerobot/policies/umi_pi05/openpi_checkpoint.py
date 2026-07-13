@@ -59,6 +59,7 @@ def load_openpi_umi_pi05_config(path: str | Path, *, device: str | None = None) 
         n_action_steps=10,
         max_state_dim=32,
         max_action_dim=32,
+        dtype="bfloat16",
     )
     config.input_features = {
         OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(20,)),

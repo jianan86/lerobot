@@ -223,3 +223,151 @@ def test_preprocess_fisheye_resize_pad_uint8_contiguous():
     assert processed.flags.c_contiguous
     assert processed[:4].max() == 0
     assert processed[-4:].max() == 0
+
+
+
+class _FakeUmiAdapter:
+    def __init__(self):
+        self.targets = []
+
+    def tcp_pose7_to_ee_actions(self, target):
+        self.targets.append(target.clone())
+        return (
+            {"right.x": float(target[0]), "gripper.pos": float(target[6])},
+            {"left.x": float(target[7]), "gripper.pos": float(target[13])},
+        )
+
+
+class _FakeRobot:
+    def __init__(self):
+        self.actions = []
+
+    def send_action(self, action):
+        self.actions.append(dict(action))
+
+
+class _FakeGripper:
+    def __init__(self):
+        self.widths = []
+
+    def execute_width(self, width):
+        self.widths.append(float(width))
+
+
+def _chunk_exec_cfg(**overrides):
+    values = {
+        "arm_mode": "dual",
+        "dry_run_actions": False,
+        "max_steps": None,
+        "max_xyz_step": 0.03,
+        "max_rpy_step": 0.2,
+        "max_gripper_step": 0.01,
+        "pika_gripper_min_width_m": 0.0,
+        "pika_gripper_max_width_m": 0.085,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_execute_tcp_action_chunk_executes_all_actions_with_step_limits():
+    cfg = _chunk_exec_cfg()
+    adapter = _FakeUmiAdapter()
+    right_robot = _FakeRobot()
+    left_robot = _FakeRobot()
+    right_gripper = _FakeGripper()
+    left_gripper = _FakeGripper()
+    sleeps = []
+    actions = torch.zeros(3, 14)
+    actions[:, 0] = 0.1
+    actions[:, 7] = -0.1
+    actions[:, 6] = torch.tensor([0.02, 0.03, 0.04])
+    actions[:, 13] = torch.tensor([0.02, 0.03, 0.04])
+
+    last_target, executed_steps = umi_client._execute_tcp_action_chunk(
+        actions,
+        torch.zeros(14),
+        cfg,
+        adapter,
+        right_robot,
+        left_robot,
+        right_gripper,
+        left_gripper,
+        dt=0.1,
+        executed_steps=0,
+        sleep_fn=sleeps.append,
+        perf_counter=lambda: 0.0,
+    )
+
+    assert executed_steps == 3
+    assert len(right_robot.actions) == 3
+    assert len(left_robot.actions) == 3
+    assert right_gripper.widths == pytest.approx([0.01, 0.02, 0.03])
+    assert left_gripper.widths == pytest.approx([0.01, 0.02, 0.03])
+    assert sleeps == pytest.approx([0.1, 0.1])
+    torch.testing.assert_close(torch.tensor([t[0] for t in adapter.targets]), torch.tensor([0.03, 0.06, 0.09]))
+    torch.testing.assert_close(torch.tensor([t[7] for t in adapter.targets]), torch.tensor([-0.03, -0.06, -0.09]))
+    torch.testing.assert_close(last_target, adapter.targets[-1])
+
+
+def test_execute_tcp_action_chunk_dry_run_updates_target_without_sending():
+    cfg = _chunk_exec_cfg(dry_run_actions=True)
+    adapter = _FakeUmiAdapter()
+    right_robot = _FakeRobot()
+    left_robot = _FakeRobot()
+    right_gripper = _FakeGripper()
+    left_gripper = _FakeGripper()
+    actions = torch.zeros(2, 14)
+    actions[:, 0] = 0.02
+
+    last_target, executed_steps = umi_client._execute_tcp_action_chunk(
+        actions,
+        torch.zeros(14),
+        cfg,
+        adapter,
+        right_robot,
+        left_robot,
+        right_gripper,
+        left_gripper,
+        dt=0.1,
+        executed_steps=0,
+        sleep_fn=lambda _duration: None,
+        perf_counter=lambda: 0.0,
+    )
+
+    assert executed_steps == 2
+    assert right_robot.actions == []
+    assert left_robot.actions == []
+    assert right_gripper.widths == []
+    assert left_gripper.widths == []
+    torch.testing.assert_close(last_target, adapter.targets[-1])
+
+
+def test_execute_tcp_action_chunk_respects_max_steps_inside_chunk():
+    cfg = _chunk_exec_cfg(max_steps=2)
+    adapter = _FakeUmiAdapter()
+    right_robot = _FakeRobot()
+    left_robot = _FakeRobot()
+    sleeps = []
+    actions = torch.zeros(3, 14)
+    actions[:, 0] = 0.01
+
+    _last_target, executed_steps = umi_client._execute_tcp_action_chunk(
+        actions,
+        torch.zeros(14),
+        cfg,
+        adapter,
+        right_robot,
+        left_robot,
+        None,
+        None,
+        dt=0.1,
+        executed_steps=0,
+        sleep_fn=sleeps.append,
+        perf_counter=lambda: 0.0,
+    )
+
+    assert executed_steps == 2
+    assert len(right_robot.actions) == 2
+    assert len(left_robot.actions) == 2
+    assert len(adapter.targets) == 2
+    assert sleeps == pytest.approx([0.1])

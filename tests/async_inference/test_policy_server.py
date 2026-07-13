@@ -687,3 +687,115 @@ def test_pose_act_tensorrt_adapter_rejects_rgbd_inputs():
     with pytest.raises(ValueError, match="RGBD"):
         PoseACTTensorRTPolicyAdapter(PoseACTStub(config), engine_path="dummy.engine")
 
+
+
+def test_policy_server_dumps_first_client_observation(tmp_path):
+    from PIL import Image
+
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.helpers import TimedObservation
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    dump_root = tmp_path / "first_obs"
+    server = PolicyServer(PolicyServerConfig(host="localhost", port=9998, first_observation_dump_dir=str(dump_root)))
+    server.policy_type = "umi_pi05"
+    server.device = "cpu"
+
+    first = TimedObservation(
+        timestamp=123.0,
+        timestep=0,
+        observation={
+            OBS_STATE: np.arange(20, dtype=np.float32),
+            "task": "pick up bread",
+            f"{OBS_IMAGES}.cam_left_wrist": np.full((4, 5, 3), 127, dtype=np.uint8),
+            f"{OBS_IMAGES}.cam_right_wrist": np.full((2, 4, 5, 3), 64, dtype=np.uint8),
+        },
+        must_go=True,
+    )
+    second = TimedObservation(
+        timestamp=124.0,
+        timestep=1,
+        observation={OBS_STATE: np.zeros(20, dtype=np.float32), "task": "second"},
+        must_go=True,
+    )
+
+    server._dump_first_observation(first)
+    server._dump_first_observation(second)
+
+    dump_dir = dump_root / "ts-000000"
+    assert dump_dir.exists()
+    assert not (dump_root / "ts-000001").exists()
+    assert (dump_dir / "raw_observation.pt").exists()
+    assert torch.load(dump_dir / "state.pt", weights_only=False).shape == (20,)
+    assert (dump_dir / "task.txt").read_text() == "pick up bread"
+
+    metadata = (dump_dir / "metadata.json").read_text()
+    assert "observation.images.cam_left_wrist" in metadata
+    assert "observation.images.cam_right_wrist" in metadata
+
+    left_image = Image.open(dump_dir / "images" / "observation.images.cam_left_wrist.png")
+    right_image_0 = Image.open(dump_dir / "images" / "observation.images.cam_right_wrist_00.png")
+    right_image_1 = Image.open(dump_dir / "images" / "observation.images.cam_right_wrist_01.png")
+    assert left_image.size == (5, 4)
+    assert right_image_0.size == (5, 4)
+    assert right_image_1.size == (5, 4)
+
+
+def test_policy_server_overrides_tokenizer_name_when_configured(monkeypatch):
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+    from lerobot.transport import services_pb2
+
+    class PolicyStub:
+        name = "umi_pi05"
+
+        class _Config:
+            image_features = {}
+            device = "cpu"
+
+        config = _Config()
+
+        @classmethod
+        def from_pretrained(cls, _path):
+            return cls()
+
+        def to(self, _device):
+            return self
+
+    captured = {}
+
+    def fake_make_pre_post_processors(*_args, **kwargs):
+        captured["preprocessor_overrides"] = kwargs.get("preprocessor_overrides")
+        return None, None
+
+    monkeypatch.setattr("lerobot.async_inference.policy_server.get_policy_class", lambda _name: PolicyStub)
+    monkeypatch.setattr(
+        "lerobot.async_inference.policy_server.make_pre_post_processors", fake_make_pre_post_processors
+    )
+
+    def send_policy_instructions(tokenizer_name_or_path):
+        server = PolicyServer(
+            PolicyServerConfig(host="localhost", port=9997, tokenizer_name_or_path=tokenizer_name_or_path)
+        )
+        server.shutdown_event.clear()
+        request = services_pb2.PolicySetup(
+            data=pickle.dumps(
+                RemotePolicyConfig(
+                    policy_type="umi_pi05",
+                    pretrained_name_or_path="dummy/path",
+                    lerobot_features={},
+                    actions_per_chunk=4,
+                    device="cpu",
+                )
+            )
+        )
+        server.SendPolicyInstructions(request, context=type("Context", (), {"peer": lambda self: "test"})())
+
+    send_policy_instructions("/data/jianan/weight/paligemma-3b-pt-224")
+    assert captured["preprocessor_overrides"]["tokenizer_processor"] == {
+        "tokenizer_name": "/data/jianan/weight/paligemma-3b-pt-224"
+    }
+
+    send_policy_instructions(None)
+    assert "tokenizer_processor" not in captured["preprocessor_overrides"]
