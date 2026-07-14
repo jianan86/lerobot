@@ -40,10 +40,12 @@ def make_umi_pi05_pre_post_processors(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
+            eps=1e-6,
+            quantile_add_eps=True,
         ),
         Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+            tokenizer_name=config.tokenizer_name_or_path,
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",
@@ -54,6 +56,8 @@ def make_umi_pi05_pre_post_processors(
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(
             features=config.output_features,
+            eps=1e-6,
+            quantile_add_eps=True,
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),

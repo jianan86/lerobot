@@ -60,6 +60,11 @@ class TrainPipelineConfig(HubMixin):
     persistent_workers: bool = True
     steps: int = 100_000
     eval_freq: int = 20_000
+    # Offline validation is separate from environment evaluation. Set ``val_freq`` to 0 to disable it.
+    val_freq: int = 0
+    val_split_ratio: float = 0.1
+    val_batch_size: int = 1
+    val_split_seed: int = 1000
     log_freq: int = 200
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
@@ -133,6 +138,13 @@ class TrainPipelineConfig(HubMixin):
 
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+
+        if self.val_freq < 0:
+            raise ValueError(f"val_freq must be >= 0, got {self.val_freq}")
+        if self.val_freq > 0 and not 0 < self.val_split_ratio < 1:
+            raise ValueError(f"val_split_ratio must be between 0 and 1 when validation is enabled, got {self.val_split_ratio}")
+        if self.val_batch_size < 1:
+            raise ValueError(f"val_batch_size must be >= 1, got {self.val_batch_size}")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")

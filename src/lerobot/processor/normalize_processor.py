@@ -95,6 +95,7 @@ class _NormalizationMixin:
     device: torch.device | str | None = None
     dtype: torch.dtype | None = None
     eps: float = 1e-8
+    quantile_add_eps: bool = False
     normalize_observation_keys: set[str] | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
@@ -238,6 +239,8 @@ class _NormalizationMixin:
             },
             "norm_map": {ft_type.value: norm_mode.value for ft_type, norm_mode in self.norm_map.items()},
         }
+        if self.quantile_add_eps:
+            config["quantile_add_eps"] = True
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
         return config
@@ -369,12 +372,13 @@ class _NormalizationMixin:
                 raise ValueError(
                     "QUANTILES normalization mode requires q01 and q99 stats, please update the dataset with the correct stats using the `augment_dataset_quantile_stats.py` script"
                 )
-
             denom = q99 - q01
-            # Avoid division by zero by adding epsilon when quantiles are identical
-            denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
-            )
+            if self.quantile_add_eps:
+                denom = denom + self.eps
+            else:
+                denom = torch.where(
+                    denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
+                )
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q01
             return 2.0 * (tensor - q01) / denom - 1.0

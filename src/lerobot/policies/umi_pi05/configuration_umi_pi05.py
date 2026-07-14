@@ -17,6 +17,7 @@ class UmiPI05Config(PI05Config):
     n_action_steps: int = 10
     max_state_dim: int = 32
     max_action_dim: int = 32
+    tokenizer_name_or_path: str = "google/paligemma-3b-pt-224"
     use_relative_actions: bool = False
 
     def __post_init__(self):

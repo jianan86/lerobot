@@ -44,6 +44,7 @@ from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, make_dataset
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
@@ -59,6 +60,80 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+
+def split_episode_indices(
+    episode_indices: list[int], val_split_ratio: float, split_seed: int
+) -> tuple[list[int], list[int]]:
+    """Split episode indices reproducibly, keeping whole episodes in each split."""
+    if len(episode_indices) < 2:
+        raise ValueError("Offline validation requires at least two episodes.")
+
+    val_count = max(1, int(len(episode_indices) * val_split_ratio))
+    if val_count >= len(episode_indices):
+        raise ValueError("val_split_ratio leaves no episodes for training.")
+
+    generator = torch.Generator().manual_seed(split_seed)
+    permutation = torch.randperm(len(episode_indices), generator=generator).tolist()
+    val_positions = set(permutation[:val_count])
+    train_episodes = [episode for i, episode in enumerate(episode_indices) if i not in val_positions]
+    val_episodes = [episode for i, episode in enumerate(episode_indices) if i in val_positions]
+    return train_episodes, val_episodes
+
+
+def make_train_and_val_datasets(cfg: TrainPipelineConfig):
+    """Create disjoint train and validation datasets when offline validation is enabled."""
+    if cfg.val_freq == 0:
+        return make_dataset(cfg), None, None
+
+    if cfg.dataset.episodes is None:
+        metadata = LeRobotDatasetMetadata(
+            cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+        )
+        episode_indices = list(range(metadata.total_episodes))
+    else:
+        episode_indices = cfg.dataset.episodes
+
+    train_episodes, val_episodes = split_episode_indices(
+        episode_indices, cfg.val_split_ratio, cfg.val_split_seed
+    )
+    train_cfg = dataclasses.replace(cfg, dataset=dataclasses.replace(cfg.dataset, episodes=train_episodes))
+    val_cfg = dataclasses.replace(
+        cfg,
+        dataset=dataclasses.replace(
+            cfg.dataset,
+            episodes=val_episodes,
+            image_transforms=dataclasses.replace(cfg.dataset.image_transforms, enable=False),
+        ),
+    )
+    return make_dataset(train_cfg), make_dataset(val_cfg), val_episodes
+
+
+def validate_policy(
+    policy: PreTrainedPolicy,
+    dataloader: torch.utils.data.DataLoader,
+    preprocessor: Any,
+    camera_keys: list[str],
+    accelerator: "Accelerator",
+) -> float:
+    """Compute mean offline validation loss without retaining activations for backward."""
+    total_loss = 0.0
+    total_samples = 0
+    policy.eval()
+    with torch.inference_mode(), accelerator.autocast():
+        for batch in dataloader:
+            for cam_key in camera_keys:
+                if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                    batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+            batch = preprocessor(batch)
+            loss, _ = policy.forward(batch)
+            batch_size = next(value.shape[0] for value in batch.values() if isinstance(value, torch.Tensor))
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+    if total_samples == 0:
+        raise ValueError("Validation dataset contains no frames.")
+    return total_loss / total_samples
 
 
 def update_policy(
@@ -229,13 +304,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
         logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
+        dataset, val_dataset, val_episode_ids = make_train_and_val_datasets(cfg)
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
-        dataset = make_dataset(cfg)
+        dataset, val_dataset, val_episode_ids = make_train_and_val_datasets(cfg)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -376,6 +451,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
+        if val_dataset is not None:
+            logging.info(f"{val_dataset.num_episodes=}")
+            logging.info(f"Validation episode ids: {val_episode_ids}")
         num_processes = accelerator.num_processes
         effective_bs = cfg.batch_size * num_processes
         logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
@@ -407,6 +485,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
     )
+
+    val_dataloader = None
+    if val_dataset is not None:
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=0,
+            batch_size=cfg.val_batch_size,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+        )
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
@@ -478,6 +566,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = cfg.val_freq > 0 and step % cfg.val_freq == 0
 
         if is_log_step:
             logging.info(train_tracker)
@@ -516,6 +605,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
+            accelerator.wait_for_everyone()
+
+        if is_val_step:
+            if is_main_process:
+                logging.info(f"Validation loss at step {step}")
+                val_loss = validate_policy(
+                    accelerator.unwrap_model(policy),
+                    val_dataloader,
+                    preprocessor,
+                    val_dataset.meta.camera_keys,
+                    accelerator,
+                )
+                logging.info(f"Validation loss: {val_loss:.6f}")
+                if wandb_logger:
+                    wandb_logger.log_dict({"loss": val_loss}, step, mode="val")
+            policy.train()
             accelerator.wait_for_everyone()
 
         if cfg.env and is_eval_step:
