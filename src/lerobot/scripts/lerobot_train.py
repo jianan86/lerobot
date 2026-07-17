@@ -54,7 +54,7 @@ from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
-from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies import PI05Config, PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -334,6 +334,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             },
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
+        if isinstance(active_cfg, PI05Config):
+            preprocessor_overrides["tokenizer_processor"] = {
+                "tokenizer_name": active_cfg.tokenizer_name_or_path
+            }
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,
