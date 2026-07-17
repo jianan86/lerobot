@@ -79,6 +79,12 @@ lerobot-train \
   - [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base)
   - [lerobot/pi05_libero](https://huggingface.co/lerobot/pi05_libero) (specifically trained on the Libero dataset)
 
+To load the PaliGemma tokenizer from a local directory instead of the Hugging Face Hub, add:
+
+```bash
+--policy.tokenizer_name_or_path=/data/jianan/weight/paligemma-3b-pt-224
+```
+
 ### Training Parameters Explained
 
 | Parameter               | Default | Description                                 |

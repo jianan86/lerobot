@@ -27,8 +27,30 @@ from lerobot.policies.pi05 import (  # noqa: E402
     PI05Policy,
     make_pi05_pre_post_processors,  # noqa: E402
 )
+from lerobot.processor import TokenizerProcessorStep  # noqa: E402
 from lerobot.utils.random_utils import set_seed
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
+
+@pytest.mark.parametrize(
+    ("tokenizer_name_or_path", "expected_name"),
+    [
+        ("/data/jianan/weight/paligemma-3b-pt-224", "/data/jianan/weight/paligemma-3b-pt-224"),
+        (None, "google/paligemma-3b-pt-224"),
+    ],
+)
+def test_pi05_processor_uses_configured_tokenizer_name(monkeypatch, tokenizer_name_or_path, expected_name):
+    from lerobot.processor.tokenizer_processor import AutoTokenizer
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: object())
+
+    config = PI05Config()
+    if tokenizer_name_or_path is not None:
+        config.tokenizer_name_or_path = tokenizer_name_or_path
+
+    preprocessor, _ = make_pi05_pre_post_processors(config=config)
+    tokenizer_step = next(step for step in preprocessor.steps if isinstance(step, TokenizerProcessorStep))
+
+    assert tokenizer_step.tokenizer_name == expected_name
 
 
 @require_cuda
