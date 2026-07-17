@@ -18,6 +18,7 @@
 
 import pytest
 import torch
+from torch import nn
 
 pytest.importorskip("transformers")
 
@@ -27,9 +28,11 @@ from lerobot.policies.pi05 import (  # noqa: E402
     PI05Policy,
     make_pi05_pre_post_processors,  # noqa: E402
 )
+from lerobot.policies.pi05.modeling_pi05 import PaliGemmaWithExpertModel  # noqa: E402
 from lerobot.processor import TokenizerProcessorStep  # noqa: E402
 from lerobot.utils.random_utils import set_seed
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
+
 
 @pytest.mark.parametrize(
     ("tokenizer_name_or_path", "expected_name"),
@@ -51,6 +54,42 @@ def test_pi05_processor_uses_configured_tokenizer_name(monkeypatch, tokenizer_na
     tokenizer_step = next(step for step in preprocessor.steps if isinstance(step, TokenizerProcessorStep))
 
     assert tokenizer_step.tokenizer_name == expected_name
+
+
+class _DummyPaliGemma(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Linear(2, 2)
+        self.model.vision_tower = nn.Linear(2, 2)
+        self.multi_modal_projector = nn.Linear(2, 2)
+        self.lm_head = nn.Linear(2, 2, bias=False)
+
+
+def test_pi05_freeze_language_model_keeps_vision_trainable():
+    model = PaliGemmaWithExpertModel.__new__(PaliGemmaWithExpertModel)
+    nn.Module.__init__(model)
+    model.freeze_vision_encoder = False
+    model.freeze_language_model = True
+    model.train_expert_only = False
+    model.paligemma = _DummyPaliGemma()
+    model.gemma_expert = nn.Linear(2, 2)
+
+    model._set_requires_grad()
+
+    assert not any(param.requires_grad for param in model.paligemma.model.language_model.parameters())
+    assert not any(param.requires_grad for param in model.paligemma.lm_head.parameters())
+    assert any(param.requires_grad for param in model.paligemma.model.vision_tower.parameters())
+    assert any(param.requires_grad for param in model.paligemma.multi_modal_projector.parameters())
+    assert any(param.requires_grad for param in model.gemma_expert.parameters())
+
+    model.train()
+
+    assert not model.paligemma.model.language_model.training
+    assert not model.paligemma.lm_head.training
+    assert model.paligemma.model.vision_tower.training
+    assert model.paligemma.multi_modal_projector.training
+    assert model.gemma_expert.training
 
 
 @require_cuda

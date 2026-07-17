@@ -354,12 +354,14 @@ class PaliGemmaWithExpertModel(
         precision: Literal["bfloat16", "float32"] = "bfloat16",
         image_size: int = DEFAULT_IMAGE_SIZE,
         freeze_vision_encoder: bool = False,
+        freeze_language_model: bool = False,
         train_expert_only: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
+        self.freeze_language_model = freeze_language_model
         self.train_expert_only = train_expert_only
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
@@ -431,6 +433,13 @@ class PaliGemmaWithExpertModel(
             self.paligemma.model.vision_tower.eval()
             for param in self.paligemma.model.vision_tower.parameters():
                 param.requires_grad = False
+        if self.freeze_language_model:
+            self.paligemma.model.language_model.eval()
+            self.paligemma.lm_head.eval()
+            for param in self.paligemma.model.language_model.parameters():
+                param.requires_grad = False
+            for param in self.paligemma.lm_head.parameters():
+                param.requires_grad = False
         if self.train_expert_only:
             self.paligemma.eval()
             for param in self.paligemma.parameters():
@@ -440,6 +449,9 @@ class PaliGemmaWithExpertModel(
         super().train(mode)
         if self.freeze_vision_encoder:
             self.paligemma.model.vision_tower.eval()
+        if self.freeze_language_model:
+            self.paligemma.model.language_model.eval()
+            self.paligemma.lm_head.eval()
         if self.train_expert_only:
             self.paligemma.eval()
 
@@ -583,6 +595,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             precision=config.dtype,
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
+            freeze_language_model=config.freeze_language_model,
             train_expert_only=config.train_expert_only,
         )
 

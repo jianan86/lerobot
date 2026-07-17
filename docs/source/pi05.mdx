@@ -63,6 +63,7 @@ lerobot-train \
     --wandb.enable=true \
     --policy.dtype=bfloat16 \
     --policy.freeze_vision_encoder=false \
+    --policy.freeze_language_model=true \
     --policy.train_expert_only=false \
     --steps=3000 \
     --policy.device=cuda \
@@ -87,12 +88,15 @@ To load the PaliGemma tokenizer from a local directory instead of the Hugging Fa
 
 ### Training Parameters Explained
 
-| Parameter               | Default | Description                                 |
-| ----------------------- | ------- | ------------------------------------------- |
-| `freeze_vision_encoder` | `false` | Do not freeze the vision encoder            |
-| `train_expert_only`     | `false` | Do not freeze the VLM, train all parameters |
+| Parameter               | Default | Description                                       |
+| ----------------------- | ------- | ------------------------------------------------- |
+| `freeze_vision_encoder` | `false` | Do not freeze the vision encoder                  |
+| `freeze_language_model` | `false` | Do not freeze the PaliGemma language model        |
+| `train_expert_only`     | `false` | Do not freeze the VLM, train all parameters       |
 
 **💡 Tip**: Setting `train_expert_only=true` freezes the VLM and trains only the action expert and projections, allowing finetuning with reduced memory usage.
+
+To freeze only the language model while training the vision encoder, multi-modal projector, and action expert, set `freeze_language_model=true`, `freeze_vision_encoder=false`, and `train_expert_only=false`.
 
 If your dataset is not converted with `quantiles`, you can convert it with the following command:
 

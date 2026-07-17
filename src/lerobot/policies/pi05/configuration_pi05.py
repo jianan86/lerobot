@@ -86,6 +86,7 @@ class PI05Config(PreTrainedConfig):
 
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
+    freeze_language_model: bool = False  # Freeze only the PaliGemma language model
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
     # Optimizer settings: see openpi `AdamW`
