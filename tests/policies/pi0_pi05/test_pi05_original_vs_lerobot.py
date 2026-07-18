@@ -32,6 +32,7 @@ from tests.policies.pi0_pi05.openpi_pytorch.pi0_pytorch import PI0Pytorch  # noq
 from tests.policies.pi0_pi05.utils.openpi_parity import (  # noqa: E402
     assert_processor_inputs_match_lerobot,
     clone_batch,
+    deterministic_lerobot_forward_preprocess,
     deterministic_openpi_forward_preprocess,
     fix_reference_state_dict,
     fixed_flow_sampling,
@@ -216,7 +217,10 @@ def assert_forward_matches(*, compile_model: bool = False, gradient_checkpointin
         lerobot_pi05.eval()
     original_pi05.eval()
 
-    with fixed_flow_sampling(lerobot_pi05.model, noise=noise, time=time):
+    with (
+        fixed_flow_sampling(lerobot_pi05.model, noise=noise, time=time),
+        deterministic_lerobot_forward_preprocess(lerobot_pi05),
+    ):
         lerobot_loss, _ = lerobot_pi05(lerobot_batch, reduction="none")
     with deterministic_openpi_forward_preprocess(original_pi05):
         openpi_losses = original_pi05(openpi_observation, openpi_actions, noise=noise, time=time)

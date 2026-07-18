@@ -289,3 +289,15 @@ def deterministic_openpi_forward_preprocess(openpi_policy) -> Iterator[None]:
         yield
     finally:
         openpi_policy._preprocess_observation = original_preprocess_observation
+
+
+@contextmanager
+def deterministic_lerobot_forward_preprocess(lerobot_policy) -> Iterator[None]:
+    """Disable LeRobot's PI0.5 training-time image augmentation inside a parity forward block."""
+
+    original_augment_image = lerobot_policy._augment_image_for_training
+    lerobot_policy._augment_image_for_training = lambda image, key: image
+    try:
+        yield
+    finally:
+        lerobot_policy._augment_image_for_training = original_augment_image

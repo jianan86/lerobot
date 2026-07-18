@@ -951,6 +951,7 @@ class PI05Policy(PreTrainedPolicy):
 
         self.model.to(config.device)
 
+        self._image_augmentation_logged = False
         self.reset()
 
     @classmethod
@@ -1159,6 +1160,61 @@ class PI05Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    @staticmethod
+    def _augment_image_for_training(image: Tensor, key: str) -> Tensor:
+        """Apply OpenPI's PI0.5 training-time image augmentation to a channels-last image batch."""
+        image = image / 2.0 + 0.5
+
+        if "wrist" not in key:
+            height, width = image.shape[1:3]
+            crop_height = int(height * 0.95)
+            crop_width = int(width * 0.95)
+            max_h = height - crop_height
+            max_w = width - crop_width
+            if max_h > 0 and max_w > 0:
+                start_h = torch.randint(0, max_h + 1, (1,), device=image.device)
+                start_w = torch.randint(0, max_w + 1, (1,), device=image.device)
+                image = image[:, start_h : start_h + crop_height, start_w : start_w + crop_width, :]
+
+            image = F.interpolate(
+                image.permute(0, 3, 1, 2),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            ).permute(0, 2, 3, 1)
+
+            angle = torch.rand(1, device=image.device) * 10 - 5
+            if torch.abs(angle) > 0.1:
+                angle_rad = angle * torch.pi / 180.0
+                cos_a = torch.cos(angle_rad)
+                sin_a = torch.sin(angle_rad)
+                grid_x = torch.linspace(-1, 1, width, device=image.device)
+                grid_y = torch.linspace(-1, 1, height, device=image.device)
+                grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+                grid_x = grid_x.unsqueeze(0).expand(image.shape[0], -1, -1)
+                grid_y = grid_y.unsqueeze(0).expand(image.shape[0], -1, -1)
+                grid = torch.stack(
+                    [grid_x * cos_a - grid_y * sin_a, grid_x * sin_a + grid_y * cos_a], dim=-1
+                )
+                image = F.grid_sample(
+                    image.permute(0, 3, 1, 2),
+                    grid,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                ).permute(0, 2, 3, 1)
+
+        brightness_factor = 0.7 + torch.rand(1, device=image.device) * 0.6
+        image = image * brightness_factor
+        contrast_factor = 0.6 + torch.rand(1, device=image.device) * 0.8
+        mean = image.mean(dim=[1, 2, 3], keepdim=True)
+        image = (image - mean) * contrast_factor + mean
+        saturation_factor = 0.5 + torch.rand(1, device=image.device)
+        gray = image.mean(dim=-1, keepdim=True)
+        image = gray + (image - gray) * saturation_factor
+
+        return torch.clamp(image, 0, 1) * 2.0 - 1.0
+
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
@@ -1179,6 +1235,14 @@ class PI05Policy(PreTrainedPolicy):
                 f"All image features are missing from the batch. At least one expected. "
                 f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
             )
+
+        if self.training and not self._image_augmentation_logged:
+            logging.info(
+                "OpenPI PI0.5 image augmentation enabled for %d camera(s): %s",
+                len(present_img_keys),
+                ", ".join(present_img_keys),
+            )
+            self._image_augmentation_logged = True
 
         # Preprocess image features present in the batch
         for key in present_img_keys:
@@ -1205,6 +1269,8 @@ class PI05Policy(PreTrainedPolicy):
 
             # Normalize from [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
+            if self.training:
+                img = self._augment_image_for_training(img, key)
 
             # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
             if is_channels_first:

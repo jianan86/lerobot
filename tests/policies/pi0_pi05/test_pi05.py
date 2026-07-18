@@ -92,6 +92,50 @@ def test_pi05_freeze_language_model_keeps_vision_trainable():
     assert model.gemma_expert.training
 
 
+def test_pi05_training_image_augmentation_matches_openpi():
+    from types import SimpleNamespace
+
+    from tests.policies.pi0_pi05.openpi_pytorch.preprocessing_pytorch import preprocess_observation_pytorch
+
+    image_keys = ("base_0_rgb", "left_wrist_0_rgb")
+    raw_images = {
+        key: torch.rand(2, 3, 32, 32)
+        for key in image_keys
+    }
+    openpi_observation = SimpleNamespace(
+        images={key: image.permute(0, 2, 3, 1) * 2.0 - 1.0 for key, image in raw_images.items()},
+        image_masks={},
+        state=torch.zeros(2, 1),
+        tokenized_prompt=None,
+        tokenized_prompt_mask=None,
+        token_ar_mask=None,
+        token_loss_mask=None,
+    )
+
+    policy = PI05Policy.__new__(PI05Policy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(image_features=list(image_keys), image_resolution=(32, 32))
+    policy.register_parameter("_test_parameter", nn.Parameter(torch.zeros(())))
+    policy._image_augmentation_logged = False
+
+    torch.manual_seed(42)
+    expected = preprocess_observation_pytorch(
+        openpi_observation, train=True, image_keys=image_keys, image_resolution=(32, 32)
+    )
+    torch.manual_seed(42)
+    policy.train()
+    actual_images, actual_masks = policy._preprocess_images(raw_images)
+
+    for actual, key in zip(actual_images, image_keys, strict=True):
+        torch.testing.assert_close(actual, expected.images[key].permute(0, 3, 1, 2))
+    assert all(mask.all() for mask in actual_masks)
+
+    policy.eval()
+    eval_images, _ = policy._preprocess_images(raw_images)
+    for image, actual in zip(raw_images.values(), eval_images, strict=True):
+        torch.testing.assert_close(actual, image * 2.0 - 1.0)
+
+
 @require_cuda
 @require_hf_token
 def test_policy_instantiation():
