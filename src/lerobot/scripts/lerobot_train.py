@@ -57,6 +57,7 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PI05Config, PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -69,6 +70,54 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+_PI05_ABSOLUTE_ACTION_MSE_GROUPS = (
+    "left_arm",
+    "right_arm",
+    "left_gripper",
+    "right_gripper",
+)
+
+
+def _get_pi05_absolute_action_mse_groups(action_names: list[str] | None) -> dict[str, list[int]]:
+    """Split action dimensions into left/right arm and gripper metric groups."""
+    if action_names is None:
+        raise ValueError("PI0.5 absolute action MSE requires dataset action feature names.")
+
+    groups = {group: [] for group in _PI05_ABSOLUTE_ACTION_MSE_GROUPS}
+    for index, name in enumerate(action_names):
+        normalized_name = str(name).lower()
+        is_gripper = "gripper" in normalized_name
+        if "left" in normalized_name:
+            groups["left_gripper" if is_gripper else "left_arm"].append(index)
+        elif "right" in normalized_name:
+            groups["right_gripper" if is_gripper else "right_arm"].append(index)
+
+    missing_groups = [group for group, indices in groups.items() if not indices]
+    if missing_groups:
+        raise ValueError(
+            "PI0.5 absolute action MSE could not identify action dimensions for "
+            f"{missing_groups} from dataset action names: {action_names}"
+        )
+    return groups
+
+
+def _pi05_absolute_action_mse_sums(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    groups: dict[str, list[int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-group squared-error sums and element counts in raw absolute action space."""
+    targets = targets.to(device=predictions.device, dtype=torch.float32)
+    predictions = predictions.to(dtype=torch.float32)
+    squared_error = (predictions - targets).square()
+    sums = torch.stack([squared_error[..., indices].sum() for indices in groups.values()])
+    counts = torch.tensor(
+        [squared_error[..., indices].numel() for indices in groups.values()],
+        device=predictions.device,
+        dtype=sums.dtype,
+    )
+    return sums, counts
 
 
 def update_policy(
@@ -368,6 +417,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             **processor_kwargs,
         )
 
+    pi05_absolute_action_mse_groups = None
+    if isinstance(active_cfg, PI05Config) and cfg.eval_steps > 0 and eval_dataset is not None:
+        action_names = dataset.meta.features.get(ACTION, {}).get("names")
+        pi05_absolute_action_mse_groups = _get_pi05_absolute_action_mse_groups(action_names)
+
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -627,24 +681,72 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             policy.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
-            with torch.no_grad(), accelerator.autocast():
+            absolute_action_mse_sums = None
+            absolute_action_mse_counts = None
+            if pi05_absolute_action_mse_groups is not None:
+                absolute_action_mse_sums = torch.zeros(
+                    len(pi05_absolute_action_mse_groups), device=device, dtype=torch.float64
+                )
+                absolute_action_mse_counts = torch.zeros_like(absolute_action_mse_sums)
+
+            cuda_devices = [device.index] if device.type == "cuda" and device.index is not None else []
+            with (
+                torch.no_grad(),
+                accelerator.autocast(),
+                torch.random.fork_rng(devices=cuda_devices, enabled=pi05_absolute_action_mse_groups is not None),
+            ):
                 for eval_batch in eval_dataloader:
                     for cam_key in dataset.meta.camera_keys:
                         if cam_key in eval_batch and eval_batch[cam_key].dtype == torch.uint8:
                             eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
+                    raw_absolute_actions = (
+                        eval_batch[ACTION].clone() if pi05_absolute_action_mse_groups is not None else None
+                    )
                     eval_batch = preprocessor(eval_batch)
                     loss, _ = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
+
+                    if pi05_absolute_action_mse_groups is not None:
+                        predicted_actions = postprocessor(
+                            {ACTION: accelerator.unwrap_model(policy).predict_action_chunk(eval_batch)}
+                        )[ACTION]
+                        mse_sums, mse_counts = _pi05_absolute_action_mse_sums(
+                            predicted_actions, raw_absolute_actions, pi05_absolute_action_mse_groups
+                        )
+                        absolute_action_mse_sums += mse_sums.to(absolute_action_mse_sums)
+                        absolute_action_mse_counts += mse_counts.to(absolute_action_mse_counts)
             eval_loss = eval_loss_sum / max(n_eval_batches, 1)
             eval_loss = torch.tensor(eval_loss, device=device)
             eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
+            absolute_action_mses = None
+            if absolute_action_mse_sums is not None and absolute_action_mse_counts is not None:
+                absolute_action_mse_sums = accelerator.reduce(absolute_action_mse_sums, reduction="sum")
+                absolute_action_mse_counts = accelerator.reduce(absolute_action_mse_counts, reduction="sum")
+                absolute_action_mses = {
+                    group: (absolute_action_mse_sums[index] / absolute_action_mse_counts[index]).item()
+                    for index, group in enumerate(pi05_absolute_action_mse_groups)
+                }
             policy.train()
 
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                if absolute_action_mses is not None:
+                    logging.info(
+                        "step %s: %s",
+                        step,
+                        ", ".join(
+                            f"absolute_action_mse_{group}={value:.6f}"
+                            for group, value in absolute_action_mses.items()
+                        ),
+                    )
                 if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    eval_metrics = {"eval_loss": eval_loss}
+                    if absolute_action_mses is not None:
+                        eval_metrics.update(
+                            {f"absolute_action_mse_{group}": value for group, value in absolute_action_mses.items()}
+                        )
+                    wandb_logger.log_dict(eval_metrics, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
